@@ -1,6 +1,6 @@
 #pragma once
 // Tiny column-major 4x4 matrix + quaternion helpers (no external libs).
-// Hamilton quaternion convention (x,y,z,w), matching the ALVR/Pico pose frame.
+// Hamilton quaternion convention (x,y,z,w), matching the WiVRn/Pico pose frame.
 #include <cmath>
 
 struct Mat4 { float m[16]; };

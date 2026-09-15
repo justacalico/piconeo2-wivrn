@@ -16,6 +16,12 @@ static GLuint g_eye_textures[2] = {0, 0};
 static EGLImageKHR g_eye_images[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
 static AHardwareBuffer * g_last_hb[2] = {nullptr, nullptr};
 
+// Server render poses from the last synchronized blit, for the render
+// thread's warp baseline. Written by wivrn_blit_frame_pair, read by the
+// render thread when setting up the warp pose.
+XrPosef gLastServerPoses[2] = {};
+std::mutex gServerPoseMutex;
+
 bool wivrn_streaming()
 {
     return g_stream && g_stream->streaming.load();
@@ -35,6 +41,15 @@ bool wivrn_stream_resolution(int *w, int *h)
     *w = g_stream->video_desc->width;
     *h = g_stream->video_desc->height;
     return true;
+}
+
+float wivrn_stream_framerate()
+{
+    if (!g_stream || !g_stream->video_desc) return 0.0f;
+    std::lock_guard lock(g_stream->video_mutex);
+    if (!g_stream->video_desc) return 0.0f;
+    float r = g_stream->video_desc->refresh_rate;
+    return r > 0.0f ? r : g_stream->video_desc->frame_rate;
 }
 
 bool wivrn_get_synced_frames(std::shared_ptr<pico_decoded_frame> out_frames[2],
@@ -137,6 +152,57 @@ bool wivrn_blit_eye(int eye, int viewport_w, int viewport_h, XrPosef * out_pose)
     if (!g_stream) return false;
     auto frame = g_stream->get_latest_frame(eye);
     return wivrn_blit_eye_frame(eye, frame, viewport_w, viewport_h, out_pose);
+}
+
+void wivrn_blit_frame_pair(GLuint fbo, const GLuint dst_tex[2])
+{
+    if (!g_stream)
+        return;
+
+    const int eyeW = g_stream->eye_width.load();
+    const int eyeH = g_stream->eye_height.load();
+    if (eyeW <= 0 || eyeH <= 0)
+        return;
+
+    // If stream 1 falls far behind stream 0, flush its decoder so it can
+    // catch up. This prevents the right eye from showing stale frames.
+    {
+        uint64_t idx0 = g_stream->latest_decoded_frame_index_per_stream[0].load(std::memory_order_acquire);
+        uint64_t idx1 = g_stream->latest_decoded_frame_index_per_stream[1].load(std::memory_order_acquire);
+        if (idx0 > 0 && idx1 > 0)
+        {
+            int64_t gap = (int64_t)idx0 - (int64_t)idx1;
+            if (gap > 15 && g_stream->decoders[1])
+            {
+                static int flush_log_count = 0;
+                if (flush_log_count++ % 100 == 0)
+                    LOGI("stream 1 behind by %lld frames, flushing", (long long)gap);
+                g_stream->decoders[1]->flush();
+            }
+        }
+    }
+
+    // Get synchronized frames for both eyes (same frame index) to prevent
+    // the right eye from stuttering when stream 1 lags behind stream 0.
+    std::shared_ptr<pico_decoded_frame> frames[2];
+    XrPosef poses[2];
+    wivrn_get_synced_frames(frames, poses);
+
+    for (int eye = 0; eye < 2; eye++) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, dst_tex[eye], 0);
+        glViewport(0, 0, static_cast<GLsizei>(eyeW), static_cast<GLsizei>(eyeH));
+        wivrn_blit_eye_frame(eye, frames[eye], eyeW, eyeH, &poses[eye]);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Store the exact server poses from the frames that were blitted.
+    {
+        std::lock_guard<std::mutex> lk(gServerPoseMutex);
+        gLastServerPoses[0] = poses[0];
+        gLastServerPoses[1] = poses[1];
+    }
 }
 
 bool wivrn_get_server_pose(XrPosef out[2])

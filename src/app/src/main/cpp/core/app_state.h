@@ -10,13 +10,13 @@
 extern std::function<void()> gOnExit;
 
 // ---- Software IPD (lobby-adjustable, persisted) ----------------------------
-// Per-eye optical-centre offset for lobby render, warp submit pose, and ALVR
-// view_params. Stored in millimetres.
+// Per-eye optical-centre offset for lobby render, warp submit pose, and the
+// tracking uplink. Stored in millimetres.
 constexpr float kIpdMin = 58.0f, kIpdMax = 72.0f, kIpdStep = 0.5f;
 extern std::atomic<float>    gSoftIpdMm;
 extern std::atomic<bool>     gIpdDirty;     // value changed, needs persisting
 extern std::atomic<uint64_t> gIpdChangeNs;  // last-change time (debounce save)
-extern std::atomic<float>    gSentIpdMm;    // IPD last pushed to the server via view_params
+extern std::atomic<float>    gSentIpdMm;    // IPD last pushed to the server via the tracker
 inline float softIpdM() { return gSoftIpdMm.load() * 0.001f; }
 
 // ---- lobby input edges (set by the JNI key handler, consumed by render loop) -
@@ -78,14 +78,6 @@ void saveStreamFov();
 extern std::atomic<bool> gGridThemeDirty;    // rebuild floor VBO (theme changed)
 extern std::atomic<bool> gEyeTrackReapply;   // re-evaluate the Pico eye-tracking mode
 extern std::atomic<bool> gBrightnessApply;   // push gBrightnessFrac to the HMD panel
-
-// ---- streaming controller grip offset --------------------------------------
-// Baked baseline offset positioning a fixed point on the physical controller in
-// its local frame (mm): +X = right (mirrored on right hand), +Y = up toward
-// buttons, +Z = back toward wrist.
-constexpr float kBaseGripSideMm = 0.0f, kBaseGripUpMm = 12.5f, kBaseGripBackMm = 40.0f;
-constexpr float kBasePredict    = 0.4f, kBaseRotSwing = 1.0f;
-constexpr float kBaseYawDeg     = 35.0f, kBaseRotXDeg = 10.0f, kBaseRotYDeg = -34.0f;
 
 // ---- per-second diagnostics published for the HUD --------------------------
 extern std::atomic<int> gVidDecoded, gVidSubmit, gVidDropped;

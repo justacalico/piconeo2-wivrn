@@ -22,8 +22,6 @@
 #include <cstdio>
 #include <time.h>
 
-#include "alvr_client_core.h"
-#include "alvr_ext.h"    // fork-only ALVR C API additions
 #include "log.h"         // TAG / LOGI / LOGE / nowNs()
 #include "pico_sdk.h"    // Pico native SDK prototypes + config accessors + render events
 #include "streaming/streaming_client.h"  // g_stream (for tracker recenter flag)
@@ -41,7 +39,6 @@
 #include "passthrough.h" // passthrough camera background for the lobby
 #include "simple_lobby.h"// simple 3D lobby environment (floor grid + sky)
 #include "input.h"       // controller + head-pose shared state
-#include "foveation.h"   // readFoveationParams() from the settings JSON
 #include "render_thread.h"// shared render-thread lifetime/window/sleep state
 #include "streaming/wivrn_stream_adapter.h"
 
@@ -64,26 +61,14 @@ static inline void setStrBounded(char *dst, const char *src, size_t cap) {
     dst[i] = 0;
 }
 
-static const char *alvrEventName(AlvrEvent_Tag t) {
-    switch (t) {
-        case ALVR_EVENT_HUD_MESSAGE_UPDATED: return "HUD_MESSAGE_UPDATED";
-        case ALVR_EVENT_STREAMING_STARTED:   return "STREAMING_STARTED";
-        case ALVR_EVENT_STREAMING_STOPPED:   return "STREAMING_STOPPED";
-        case ALVR_EVENT_HAPTICS:             return "HAPTICS";
-        case ALVR_EVENT_DECODER_CONFIG:      return "DECODER_CONFIG";
-        case ALVR_EVENT_REAL_TIME_CONFIG:    return "REAL_TIME_CONFIG";
-        default: return "?";
-    }
-}
-
 JavaVM   *gVM       = nullptr;
 jobject   gActivity = nullptr;
 jclass    gVrClass  = nullptr;
 pthread_t gThread;
 std::atomic<bool> gRunning{false};   // render-thread lifetime
 
-// Dedicated fixed-rate tracking thread. Decoupling pose read + ALVR uplink from the
-// render thread's frame-paced spin keeps velocity filters rate-stable and bounds
+// Dedicated fixed-rate tracking thread. Decoupling pose read + tracking uplink from
+// the render thread's frame-paced spin keeps velocity filters rate-stable and bounds
 // the tracking packet rate over Wi-Fi.
 static pthread_t        gTrackThread;
 static std::atomic<bool> gTrackRunning{false};   // tracking-thread lifetime
@@ -94,24 +79,6 @@ static std::atomic<bool> gTrackRunning{false};   // tracking-thread lifetime
 // Pvr_GetPredictedDisplayTime_. Pausing the tracker for the duration of
 // the surface swap avoids the race.
 static std::atomic<bool> gTrackPaused{false};
-
-// ALVR path ids, file scope so both the render thread and tracking thread can
-// see them. Populated once after alvr_initialize().
-struct BtnIds { uint64_t trigVal, gripVal, thumbX, thumbY, thumbClick, thumbTouch, menu, face1, face2; };
-static uint64_t alvrHeadId = 0;
-static uint64_t alvrHandId[2] = { 0, 0 };
-static BtnIds   alvrBtn[2] = {};
-
-// Stale-controller suppression: a broken/missing controller may report conn=1
-// (cached CV service state) but never produce real tracking, leaving its pose
-// stuck at the exact default (origin + identity quat). After kStaleThreshold
-// frames of that, we skip forwarding it so the server doesn't render a ghost
-// controller parked at the floor. Written by the tracking thread, read by the
-// render thread (lobby pointer / model draw). Benign race: at worst the render
-// thread sees a one-frame-stale decision.
-static int  staleFrames[2] = { 0, 0 };
-static bool staleSkip[2]   = { false, false };
-static constexpr int kStaleThreshold = 150;  // ~0.5s at 300Hz before suppressing
 
 // Window handed in by the SurfaceView callbacks. The render thread owns one
 // long-lived EGL display+context; it (re)creates only the window surface as
@@ -156,8 +123,8 @@ static void buildGraphics() {
     LOGI("graphics built prog=%u", gProg);
 }
 
-// ALVR's storage uses app_dirs2, which needs $HOME (unset on Android) -> it
-// panics. Point HOME at the app's private files dir before initializing ALVR.
+// Config files live under $HOME; Android leaves it unset, so point it at the
+// app's private files dir.
 void setHomeFromFilesDir(JNIEnv *env, jobject activity) {
     jclass cls = env->GetObjectClass(activity);
     jmethodID m = env->GetMethodID(cls, "getFilesDir", "()Ljava/io/File;");
@@ -171,21 +138,21 @@ void setHomeFromFilesDir(JNIEnv *env, jobject activity) {
     env->ReleaseStringUTFChars(jpath, path);
 }
 
-// ---------- ALVR stream presentation (swapchain -> SDK warp) ----------------
-// The forked stream shader writes final present-domain bytes (warm WB + sRGB
-// encode + dither) directly into plain RGBA8 swapchain textures, handed to the
-// SDK DIATW warp with no separate sRGB-encode blit pass.
-// Ring depth: the same ring is both ALVR's render target AND the texture submitted
-// to the warp. The warp keeps up to 4 submitted entries + 1 slot we're rendering
-// into = 5.
+// ---------- WiVRn stream presentation (swapchain -> SDK warp) ----------------
+// The stream blit writes final present-domain bytes (warm WB + sRGB encode +
+// dither) directly into plain RGBA8 swapchain textures, handed to the SDK DIATW
+// warp with no separate sRGB-encode blit pass.
+// Ring depth: the same ring is both the WiVRn render target AND the texture
+// submitted to the warp. The warp keeps up to 4 submitted entries + 1 slot we're
+// rendering into = 5.
 static const int kSwapLen = 5;
 GLuint gSwap[2][kSwapLen] = {{0},{0}};
 GLuint gStreamFbo = 0;   // reusable FBO for the diag HUD overlay into gSwap
 int    gSwapIdx = 0;     // render write-head into the ring
-// Per-slot fence + the render pose that slot was rendered with.
+// Per-slot fence + the server view poses that slot was rendered with.
 static GLsync gSwapFence[kSwapLen] = {0};
-static AlvrViewParams gSwapVP[kSwapLen][2] = {};
-static uint64_t gSwapFrameTs[kSwapLen] = {0};
+static XrPosef gSwapVP[kSwapLen][2] = {};
+static uint64_t gSwapFrameIdx[kSwapLen] = {0};
 static int    gPrevSwapIdx = -1;
 static bool   gPrevSwapValid = false;
 // Async present state: the SDK DIATW compositor owns the window and re-projects
@@ -198,36 +165,19 @@ static bool   gPrevSwapValid = false;
 static std::atomic<bool>   gWarpToWindow{false};  // warp thread was given the real window surface
 static std::atomic<bool>   gAtwEnabled{false};
 uint32_t gStreamW = 0, gStreamH = 0;
-// Foveation params currently APPLIED to the de-foveation pipeline. Cached so we
-// can detect a server-side foveation change mid-session and re-sync.
-static bool  gFoveOn = false;
-static float gFovParams[6] = {0,0,0,0,0,0};   // csx,csy,shx,shy,erx,ery (currently APPLIED)
-// Foveation re-sync debounce. A re-sync rebuilds the de-foveation swapchain
-// (multi-MB GPU realloc), so a burst of REAL_TIME_CONFIG events coalesces into
-// one rebuild once params settle ~250ms.
-static float    gFovPending[6] = {0,0,0,0,0,0};
-static uint64_t gFovPendingNs = 0;
-static bool     gFovResyncPending = false;
-static const uint64_t kFovDebounceNs = 250000000ULL;   // 250ms settle window
 // Proximity sleep: Java sets gSleepReq true after the headset is OFF the head for
-// the timeout, false on don. The render thread pauses ALVR (server stops sending,
-// decoder torn down) to save power, then resumes on wear. alvr_pause/resume must
-// run on THIS thread where the connection lives.
+// the timeout, false on don. The render thread drops to the lobby while off-head
+// and reports the user-presence change to the server.
 std::atomic<bool> gSleepReq{false};
 static std::atomic<bool> gSlept{false};
-// Play-area extents (meters) from the Pico boundary; forwarded to SteamVR as
-// chaperone on each STREAMING_STARTED. 0 = none configured.
-static float gPlayspaceW = 0.0f, gPlayspaceD = 0.0f;
-// Negotiated stream refresh rate; fed to the decoder as frame-rate so the Venus
-// driver stops logging "Unable to convey fps info".
+// Negotiated stream refresh rate.
 static float gRefreshHint = 72.0f;
-// Stream-lifecycle flags. Read/written from the render loop and the ALVR
-// event handler thread, so they are atomic for cross-thread visibility.
+// Stream-lifecycle flag: true inside the stream connected..disconnected window.
+// Frames only render once wivrn_stream_ready() also reports the video
+// description and decoded frames have landed.
 static std::atomic<bool>   gStreaming{false};
-static std::atomic<bool>   gDecoderReady{false};
-static std::atomic<bool>   gAlvrGlReady{false};
-// Set by STREAMING_STARTED, consumed by the video submit path: reset the frame
-// pacer + per-second video counters at the start of each stream.
+// Set on the stream-start edge, consumed by the video submit path: reset the
+// frame pacer + per-second video counters at the start of each stream.
 static bool   gResetPacer = false;
 
 
@@ -628,38 +578,6 @@ static void buildTextBuffers() {
     glBindVertexArray(0);
 }
 
-// Cached video decoder config so we can recreate the decoder after a proximity-sleep
-// teardown without waiting for a reconnect.
-static int      gDecCodec   = 0;
-static uint8_t  gDecCfg[16384];
-static uint64_t gDecCfgLen  = 0;
-static bool     gHaveDecCfg = false;
-// The decoder output-pump thread is created + destroyed with each decoder, so
-// the big-core pin must be re-armed every time. createVideoDecoder clears these.
-static bool     gDecoderPinned = false;
-static int      gDecoderPinTries = 0;
-// Same for the fork's video receive thread ("AlvrVideoRecv"), created per connection.
-static bool     gVideoRecvPinned = false;
-static int      gVideoRecvPinTries = 0;
-
-// Push Software IPD + FOV to the server. Called at STREAMING_STARTED and whenever
-// the IPD changes mid-stream.
-static void sendViewParams() {
-    // Per-eye HALF-FOV in radians. The stock server renders to exactly this, so
-    // lowering gStreamFovDeg packs more pixels/degree. MUST match writeSdkFov()
-    // or the server's image is stretched across the warp's map.
-    const float hh = gStreamFovDeg.load() * 0.5f * (float) M_PI / 180.0f;
-    AlvrViewParams vp[2];
-    for (int e = 0; e < 2; e++) {
-        vp[e].pose.orientation = { 0, 0, 0, 1 };
-        vp[e].pose.position[0] = (e == 0 ? -softIpdM()*0.5f : softIpdM()*0.5f);
-        vp[e].pose.position[1] = 0; vp[e].pose.position[2] = 0;
-        vp[e].fov = { -hh, hh, hh, -hh };
-    }
-    alvr_send_view_params(vp);
-    gSentIpdMm.store(gSoftIpdMm.load());
-}
-
 // Report HMD + controller battery levels to the server so the SteamVR dashboard
 // shows real charge. HMD level from Android's power_supply sysfs; controllers
 // report 0..100 via the CV service (keys[10]).
@@ -669,7 +587,6 @@ static void sendBatteryReports() {
     if (f) { if (fscanf(f, "%ld", &cap) != 1) cap = -1; fclose(f); }
     f = fopen("/sys/class/power_supply/battery/status", "r");
     if (f) { char s[32] = {0}; if (fgets(s, sizeof(s), f)) plugged = (strstr(s, "Charging") || strstr(s, "Full")); fclose(f); }
-    if (cap >= 0) alvr_send_battery(alvrHeadId, (float) cap / 100.0f, plugged);
 
     // WiVRn protocol battery packet for the HMD.
     if (cap >= 0 && g_stream && g_stream->session) {
@@ -692,8 +609,6 @@ static void sendBatteryReports() {
           cconn[h] = true;
           if (gCtrl[h].keyCount > 10) cbat[h] = gCtrl[h].keys[10];
       } }
-    for (int h = 0; h < 2; h++)
-        if (cbat[h] >= 0) alvr_send_battery(alvrHandId[h], (float) cbat[h] / 100.0f, false);
 
     // Push to Java UI
     androidUiPushBattery((int)cap, cbat[0], cconn[0], cbat[1], cconn[1]);
@@ -760,46 +675,6 @@ static void sendDiagData() {
     androidUiPushDiag(mode, pipeline, system);
 }
 
-
-// (Re)create the MediaCodec video decoder from the cached stream config.
-static void createVideoDecoder() {
-    if (!gHaveDecCfg) return;
-    // gRefreshHint is set by STREAMING_STARTED, which fires before this. If we
-    // reach here with !gStreaming the ordering broke and gRefreshHint may be stale.
-    if (!gStreaming)
-        LOGE("createVideoDecoder: !gStreaming -- gRefreshHint(%.1f) may be stale/default", gRefreshHint);
-    AlvrDecoderConfig dc = {};
-    dc.codec = (AlvrCodec) gDecCodec;
-    dc.force_software_decoder   = false;
-    // 1.5-frame jitter buffer: lower QUEUE latency than 2.0 with no starvation.
-    dc.max_buffering_frames     = 1.5f;
-    dc.buffering_history_weight = 0.90f;
-    int fps = (int)(gRefreshHint > 1.0f ? gRefreshHint + 0.5f : 72.0f);
-    // Local (not static): alvr_create_decoder copies the options into an owned Vec
-    // during the call, so the array only needs to live until then.
-    AlvrMediacodecOption decOpts[5] = {};
-    decOpts[0].key = "vendor.qti-ext-dec-low-latency.enable";
-    decOpts[0].ty = ALVR_MEDIACODEC_PROP_TYPE_INT32; decOpts[0].value.int32 = 1;
-    decOpts[1].key = "low-latency";
-    decOpts[1].ty = ALVR_MEDIACODEC_PROP_TYPE_INT32; decOpts[1].value.int32 = 1;
-    decOpts[2].key = "frame-rate";
-    decOpts[2].ty = ALVR_MEDIACODEC_PROP_TYPE_INT32; decOpts[2].value.int32 = fps;
-    // Give the Venus driver an explicit OPERATING RATE (= refresh) for a stable
-    // clock, and PRIORITY 0 (realtime). operating-rate = target fps, NOT a max-clock
-    // request (SHORT_MAX), that would only add heat on this thermally limited SoC.
-    decOpts[3].key = "operating-rate";
-    decOpts[3].ty = ALVR_MEDIACODEC_PROP_TYPE_INT32; decOpts[3].value.int32 = fps;
-    decOpts[4].key = "priority";
-    decOpts[4].ty = ALVR_MEDIACODEC_PROP_TYPE_INT32; decOpts[4].value.int32 = 0;
-    dc.options = decOpts; dc.options_count = 5;
-    dc.config_buffer = gDecCfg;
-    dc.config_buffer_size = gDecCfgLen;
-    alvr_create_decoder(dc);
-    gDecoderReady = true;
-    gDecoderPinned = false; gDecoderPinTries = 0;   // re-arm big-core pin for new pump thread
-    LOGI("video decoder created codec=%d config=%llu bytes buffering=%.2f fps/operating-rate=%d (refreshHint=%.1f) opts=5",
-         gDecCodec, (unsigned long long)gDecCfgLen, dc.max_buffering_frames, fps, gRefreshHint);
-}
 
 // Head-gaze crosshair: a small "+" centred at the origin (XY plane, in metres).
 static void buildReticle() {
@@ -942,7 +817,7 @@ static void destroyStreamSwapchain() {
     // the invariant safe (a non-unit quat from stale memory would be rejected
     // by the warp's SelectRT).
     memset(gSwapVP, 0, sizeof(gSwapVP));
-    memset(gSwapFrameTs, 0, sizeof(gSwapFrameTs));
+    memset(gSwapFrameIdx, 0, sizeof(gSwapFrameIdx));
     gSwapIdx = 0;
     gPrevSwapIdx = -1; gPrevSwapValid = false;
     if (gStreamFbo != 0) { glDeleteFramebuffers(1, &gStreamFbo); gStreamFbo = 0; }
@@ -967,38 +842,6 @@ static void createStreamSwapchain(uint32_t w, uint32_t h) {
     glGenFramebuffers(1, &gStreamFbo);   // diag HUD overlay draws into gSwap via this
     glBindTexture(GL_TEXTURE_2D, 0);
     LOGI("created stream swapchain %ux%u x%d/eye", w, h, kSwapLen);
-}
-
-// Apply a foveation re-sync: rebuild the de-foveation swapchain + restart the
-// stream renderer with new FFR params. Debounced by the caller. Caller guarantees
-// gStreaming && gAlvrGlReady && gFoveOn && gStreamW>0 and GL context is current.
-static void applyFoveationResync(const float np[6]) {
-    memcpy(gFovParams, np, sizeof(gFovParams));
-    uint32_t swapW = gStreamW, swapH = gStreamH;
-    if (g_stream) {
-        int ew = g_stream->eye_width.load();
-        int eh = g_stream->eye_height.load();
-        if (ew > 0 && eh > 0) { swapW = ew; swapH = eh; }
-    }
-    createStreamSwapchain(swapW, swapH);
-    const uint32_t *swapArr[2] = { gSwap[0], gSwap[1] };
-    AlvrStreamConfig sc = {};
-    sc.view_resolution_width  = swapW;
-    sc.view_resolution_height = swapH;
-    sc.swapchain_textures = (const uint32_t **) swapArr;
-    sc.swapchain_length   = kSwapLen;
-    sc.enable_foveation        = gFoveOn;
-    sc.foveation_center_size_x = np[0];
-    sc.foveation_center_size_y = np[1];
-    sc.foveation_center_shift_x= np[2];
-    sc.foveation_center_shift_y= np[3];
-    sc.foveation_edge_ratio_x  = np[4];
-    sc.foveation_edge_ratio_y  = np[5];
-    sc.enable_upscaling   = false;
-    alvr_start_stream_opengl(sc);
-    gSwapIdx = 0;   // createStreamSwapchain already reset the pipeline
-    LOGI("REAL_TIME_CONFIG: de-foveation re-synced center=(%.3f,%.3f) shift=(%.3f,%.3f) edge=(%.2f,%.2f)",
-         np[0],np[1],np[2],np[3],np[4],np[5]);
 }
 
 static void callVrStatic(JNIEnv *env, const char *name) {
@@ -1271,56 +1114,6 @@ static int pinWarpThreadForLowLatency(int guessReservedCpu) {
     return warpCore;
 }
 
-// Pin the fork's decoder output-pump thread ("AlvrDecOutput") to the big cores +
-// raise its priority. It loops dequeue_output_buffer + release_output_buffer, pacing
-// how fast decoded frames land in the ImageReader. reservedCpu = the warp's dedicated
-// big core, kept OUT of the decoder mask. Returns true once found + pinned.
-static bool pinDecoderThreadForLowLatency(int reservedCpu) {
-    pid_t decTid = findTidByComm("AlvrDecOutput");
-    if (!decTid) return false;   // pump not up / not named yet -> caller retries
-
-    long lo = 0, hi = 0;
-    cpu_set_t set = bigCoreSetExcept(reservedCpu, lo, hi);   // big half minus the warp's core
-    if (sched_setaffinity(decTid, sizeof(set), &set) == 0)
-        LOGI("decoder pump tid=%d pinned to big cores [%ld..%ld] minus warp core %d",
-             (int)decTid, lo, hi, reservedCpu);
-    else
-        LOGI("decoder pump affinity failed (errno=%d)", errno);
-    // prio just below the warp (3), match the submit thread's 2.
-    struct sched_param sp; sp.sched_priority = 2;
-    if (sched_setscheduler(decTid, SCHED_FIFO, &sp) == 0)
-        LOGI("decoder pump SCHED_FIFO prio=2");
-    else if (setpriority(PRIO_PROCESS, decTid, -8) == 0)
-        LOGI("decoder pump SCHED_FIFO denied (errno=%d); set nice=-8", errno);
-    else
-        LOGI("decoder pump prio elevation denied (errno=%d)", errno);
-    return true;
-}
-
-// Pin the fork's video receive thread ("AlvrVideoRecv") to the big cores minus the
-// warp's core, mirroring the decoder pump. Light thread, so priority is left below
-// the pump/submit (nice fallback only), affinity is the win here. Returns true
-// once found + pinned.
-static bool pinVideoRecvThreadForLowLatency(int reservedCpu) {
-    pid_t recvTid = findTidByComm("AlvrVideoRecv");
-    if (!recvTid) return false;   // recv thread not up / not named yet -> caller retries
-
-    long lo = 0, hi = 0;
-    cpu_set_t set = bigCoreSetExcept(reservedCpu, lo, hi);   // big half minus the warp's core
-    if (sched_setaffinity(recvTid, sizeof(set), &set) == 0)
-        LOGI("video recv tid=%d pinned to big cores [%ld..%ld] minus warp core %d",
-             (int)recvTid, lo, hi, reservedCpu);
-    else
-        LOGI("video recv affinity failed (errno=%d)", errno);
-    // Elevated nice so a background task can't preempt the frame's first hop,
-    // but below the pump/submit RT band.
-    if (setpriority(PRIO_PROCESS, recvTid, -6) == 0)
-        LOGI("video recv nice=-6");
-    else
-        LOGI("video recv prio elevation denied (errno=%d)", errno);
-    return true;
-}
-
 // Pin the SoC CPU/GPU perf level via the Pico/QVR perf service. Always on, so we
 // don't depend on the headset's Power Profile for a stable floor during streaming.
 // Level range 0..5 (5 = max, 0 = system default). Thermal governor still clamps
@@ -1538,10 +1331,12 @@ static void logActualClocks(const char *ctx) {
          c4 > 0 ? c4 / 1000 : -1, c4m > 0 ? c4m / 1000 : -1);
 }
 
-// Fixed-rate tracking/uplink thread. Reads head pose, derives filtered velocity,
-// reads eye gaze + controllers, and pushes the tracking frame to ALVR, decoupled
-// from the render thread so rate-stable filters hold their time constants and the
-// uplink fires at a constant ~300Hz. No JNI, so it does NOT attach to the JVM.
+// Fixed-rate tracking/sampling thread. Reads the head pose at ~300Hz and eye
+// gaze at ~100Hz, decoupled from the render thread so the reads stay rate-stable.
+// The pico_native_tracker owns the actual tracking uplink; this thread only feeds
+// gHeadData (render thread lobby transform + Java poller) and the gaze cache
+// (gGazeLocal/gGazeValid, consumed by pico_tracking + the debug overlay).
+// No JNI, so it does NOT attach to the JVM.
 static void *trackingThread(void *) {
     // Keep this thread on the LITTLE cores, off the gold cores the render + warp
     // threads contend for. It's only ~300Hz of light pose work.
@@ -1557,38 +1352,9 @@ static void *trackingThread(void *) {
         }
     }
     const long  kPeriodNs = 1000000000L / 300;   // ~300Hz fixed cadence
-    // Decouple the UPLINK packet rate from the FILTER step rate. The EMA filters
-    // must step at the full 300Hz to hold their tuned tau's, but the server only
-    // needs ~150Hz for extrapolation to 72Hz display. Step every loop but only SEND
-    // every kUplinkDiv-th iteration, halving tracking packets over the Wi-Fi link.
-    const int   kUplinkDiv = 2;                  // 300Hz / 2 = ~150Hz uplink
     int  tframe = 0;
-    // head-velocity filter state
-    Quat     prevQ   = { 0, 0, 0, 1 };
-    float    prevP[3] = { 0, 0, 0 };
-    uint64_t prevTs  = 0;
-    bool     havePrev = false;
-    float    fLin[3] = { 0, 0, 0 };   // EMA-filtered linear velocity (m/s)
-    float    fAng[3] = { 0, 0, 0 };   // EMA-filtered angular velocity (rad/s, world)
-    float    ctrlOrigin[3] = { 0.0f, 1.6f, 0.0f };
-    bool     ctrlOriginSet = false;
-    // controller button edge-detect state (only emit deltas; see render loop note)
-    bool  lastBin[2][5]  = {};
-    bool  binInit[2]     = { false, false };
-    float lastScal[2][4] = {};
-    bool  scalInit[2]    = { false, false };
-    // Controller linear-velocity filter state (per hand). The CV service has no
-    // hardware linear velocity, so we differentiate the world position and EMA-smooth
-    // it. Stepped ONLY on a fresh CV sample to avoid dt-noise from duplicate reads.
-    float    ctrlPrevP[2][3]  = {};     // last world pos used for differencing
-    uint64_t ctrlPrevTs[2]    = { 0, 0 };
-    bool     ctrlHavePrev[2]  = { false, false };
-    float    ctrlRawP[2][3]   = {};     // last raw sample seen (new-sample detect)
-    float    ctrlFLin[2][3]   = {};     // EMA-filtered CENTER linear velocity (m/s, pose frame)
-    // Eye-gaze read cadence. Pvr_GetEyeTrackingData is heavy, so call it at ~100Hz
-    // (every 3rd 300Hz tick) and reuse the cached gaze between ticks.
-    XrPosef eyeGazeCache[2] = {};
-    bool     eyeVLCache = false, eyeVRCache = false;
+    // Eye-gaze read cadence. Pvr_GetEyeTrackingData is heavy, so call it at
+    // ~100Hz (every 3rd 300Hz tick).
 
     // Pace the loop against an ABSOLUTE deadline so scheduling jitter + oversleep
     // don't accumulate and drift the real rate below 300Hz.
@@ -1614,376 +1380,21 @@ static void *trackingThread(void *) {
             gHeadData[0]=qx; gHeadData[1]=qy; gHeadData[2]=qz; gHeadData[3]=qw;
             gHeadData[4]=px; gHeadData[5]=py; gHeadData[6]=pz;
         }
-        if (!ctrlOriginSet && py > 0.5f) {
-            ctrlOrigin[0] = px; ctrlOrigin[1] = py; ctrlOrigin[2] = pz;
-            ctrlOriginSet = true;
-            LOGI("controller world origin captured (%.2f,%.2f,%.2f)", px, py, pz);
-        }
-
-        // All alvr_send_* functions are no-op stubs in the WiVRn streaming path.
-        // The pico_native_tracker handles all tracking uplink. Skip the useless ALVR
-        // velocity filtering, motion building, and button edge detection. The head
-        // pose is already published to gHeadData above.
-        // BUT we still need to read eye tracking data here so that gGazeLocal /
-        // gGazeValid / gEyeOnline get populated for the WiVRn tracker (pico_tracking
-        // reads them via pollEyeGaze) and the debug overlay.
+        // Eye gaze still has to be read here: it populates gGazeLocal/gGazeValid/
+        // gEyeOnline for the WiVRn tracker (pico_tracking reads them via
+        // pollEyeGaze) and the debug overlay.
         {
             Quat headQ = quatNorm({ qx, qy, qz, qw });
             const int kEyeDiv = 3;   // 300Hz / 3 = ~100Hz
             if ((tframe % kEyeDiv) == 0) {
                 XrPosef eg[2]; bool vL=false, vR=false;
-                if (!readEyeGazes(eg, &vL, &vR, tframe, headQ))
-                    vL = vR = false;
-                eyeGazeCache[0] = eg[0]; eyeGazeCache[1] = eg[1];
-                eyeVLCache = vL; eyeVRCache = vR;
+                readEyeGazes(eg, &vL, &vR, tframe, headQ);
             }
         }
-        tframe++;
-        tsAddNs(nextTick, kPeriodNs);
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &nextTick, nullptr);
-        continue;
-
-        // ---- Below: dead code (alvr_send_* are stubs) kept for reference ----
-        AlvrDeviceMotion hmd = {};
-        hmd.device_id = alvrHeadId;
-        hmd.pose.orientation = { qx, qy, qz, qw };
-        hmd.pose.position[0] = px; hmd.pose.position[1] = py; hmd.pose.position[2] = pz;
-
-        const uint64_t ts = nowNs();
-
-        // ---- Head-velocity prediction (server-side extrapolation) -----------
-        {
-            Quat curQ = quatNorm({ qx, qy, qz, qw });
-            if (havePrev) {
-                double dt = (double)(ts - prevTs) * 1e-9;
-                if (dt > 0.002 && dt < 0.05) {        // 2ms..50ms; else skip this sample
-                    // dt-normalized EMA (rate-stable): tau=0.66s, correct at the
-                    // ~300Hz this thread runs at (independent of step rate).
-                    const float a = 1.0f - expf(-(float)dt / 0.66f);
-                    float lvx = (float)((px - prevP[0]) / dt);
-                    float lvy = (float)((py - prevP[1]) / dt);
-                    float lvz = (float)((pz - prevP[2]) / dt);
-                    Quat dq = quatNorm(quatMul(curQ, quatConj(prevQ)));
-                    if (dq.w < 0) { dq.x=-dq.x; dq.y=-dq.y; dq.z=-dq.z; dq.w=-dq.w; }
-                    float w   = dq.w > 1.0f ? 1.0f : dq.w;
-                    float ang = 2.0f * acosf(w);
-                    float s   = sqrtf(1.0f - w*w);
-                    float avx = 0, avy = 0, avz = 0;
-                    if (s > 1e-6f) {
-                        float k = (ang / s) / (float)dt;
-                        avx = dq.x * k; avy = dq.y * k; avz = dq.z * k;
-                    }
-                    fLin[0] += (lvx - fLin[0]) * a; fLin[1] += (lvy - fLin[1]) * a; fLin[2] += (lvz - fLin[2]) * a;
-                    fAng[0] += (avx - fAng[0]) * a; fAng[1] += (avy - fAng[1]) * a; fAng[2] += (avz - fAng[2]) * a;
-                }
-            }
-            prevQ = curQ; prevP[0]=px; prevP[1]=py; prevP[2]=pz; prevTs = ts; havePrev = true;
-            // Position: scale the reported linear velocity by the same predict factor
-            // the controllers use (kBasePredict), so the head's positional extrapolation
-            // reach matches the hands' instead of running at full 1.0. Rotation is left
-            // unscaled, the DIATW warp already reprojects orientation to the live pose
-            // every vsync locally, so the server-side angular reach isn't the lever here.
-            float hp = kBasePredict;
-            if (hp < 0.0f) hp = 0.0f; else if (hp > 1.0f) hp = 1.0f;
-            hmd.linear_velocity[0]  = fLin[0] * hp; hmd.linear_velocity[1]  = fLin[1] * hp; hmd.linear_velocity[2]  = fLin[2] * hp;
-            hmd.angular_velocity[0] = fAng[0]; hmd.angular_velocity[1] = fAng[1]; hmd.angular_velocity[2] = fAng[2];
-        }
-
-        // Eye gaze (Neo 2 EYE); no-op on non-Eye units (returns false). Read at
-        // ~100Hz and reuse the cache between reads (the in-between uplinks still carry
-        // the latest gaze). The cached pose is global-space (composed with the headQ
-        // at read time); ~10ms of head motion between reads is negligible for gaze OSC.
-        XrPosef eyeGaze[2];
-        const XrPosef *eyeGazePtr[2] = { nullptr, nullptr };
-        const XrPosef *const *eyeGazes = nullptr;
-        const int kEyeDiv = 3;   // 300Hz / 3 = ~100Hz
-        if ((tframe % kEyeDiv) == 0) {
-            if (!readEyeGazes(eyeGazeCache, &eyeVLCache, &eyeVRCache, tframe, quatNorm({ qx, qy, qz, qw })))
-                eyeVLCache = eyeVRCache = false;   // blink/invalid -> don't forward stale gaze
-        }
-        eyeGaze[0] = eyeGazeCache[0]; eyeGaze[1] = eyeGazeCache[1];
-        bool vL = eyeVLCache, vR = eyeVRCache;
-        if (vL) eyeGazePtr[0] = &eyeGaze[0];
-        if (vR) eyeGazePtr[1] = &eyeGaze[1];
-        if (vL || vR) eyeGazes = eyeGazePtr;
-
-        // ---- Controllers: forward 6DoF (+touchpad) to ALVR (Neo 2 EYE) -------
-        AlvrDeviceMotion motions[3];
-        motions[0] = hmd;
-        int motionCount = 1;
-        CtrlState cs[2];
-        { std::lock_guard<std::mutex> lk(gCtrlMutex); cs[0] = gCtrl[0]; cs[1] = gCtrl[1]; }
-        // Stale-controller detection: a broken/missing controller may report
-        // conn=1 (cached CV service state) but never produce real tracking,
-        // leaving its pose stuck at the exact default (origin + identity quat).
-        // If that holds for a sustained window, skip forwarding it so the server
-        // doesn't render a ghost controller parked at the floor. The moment real
-        // tracking arrives (pose deviates from default), the hand re-arms.
-        for (int h = 0; h < 2; h++) {
-            bool isDefault = cs[h].conn == 1 &&
-                cs[h].pos[0] == 0.0f && cs[h].pos[1] == 0.0f && cs[h].pos[2] == 0.0f &&
-                cs[h].q[0] == 0.0f && cs[h].q[1] == 0.0f && cs[h].q[2] == 0.0f && cs[h].q[3] == 1.0f;
-            if (isDefault) {
-                if (staleFrames[h] < kStaleThreshold) staleFrames[h]++;
-                if (staleFrames[h] >= kStaleThreshold && !staleSkip[h]) {
-                    LOGI("CTRL[%d] stale (conn=1 but pose at origin for >%.1fs) -> suppressing ghost",
-                         h, kStaleThreshold / 300.0f);
-                    staleSkip[h] = true;
-                }
-            } else {
-                if (staleSkip[h]) LOGI("CTRL[%d] tracking resumed -> forwarding", h);
-                staleSkip[h] = false;
-                staleFrames[h] = 0;
-            }
-        }
-        // In the lobby (manual lobby over a live stream) suppress ALL controller
-        // input to the server, motions AND buttons, so interacting with our
-        // menu doesn't fire ghost actions in the SteamVR scene. HMD pose + eye data
-        // still flow (not "actions"). Only the HMD motion is forwarded.
-        bool inLobby = gManualLobby.load();
-        for (int h = 0; h < 2 && !inLobby; h++) {
-            if (!cs[h].fresh || cs[h].conn != 1 || staleSkip[h]) continue;
-            AlvrDeviceMotion &m = motions[motionCount++];
-            m = {};
-            m.device_id = alvrHandId[h];
-            Quat oq = { -cs[h].q[0], -cs[h].q[1], cs[h].q[2], cs[h].q[3] };
-            float kYawOutDeg = kBaseYawDeg;   // baked baseline
-            float yaw = (h == 0 ? +kYawOutDeg : -kYawOutDeg) * 0.01745329f;
-            Quat qYaw = { 0.0f, sinf(yaw*0.5f), 0.0f, cosf(yaw*0.5f) };
-            oq = quatNorm(quatMul(oq, qYaw));
-            // Controller rotation offset, baked from the ALVR dashboard "Left
-            // controller rotation offset" (XYZ euler degrees). The server applies it
-            // as a final LOCAL post-multiply (Quat::from_euler(XYZ); see server_core
-            // tracking/mod.rs) with the RIGHT hand mirrored on Y and Z (X unchanged).
-            // We replicate it here so it lives in client code, keep the dashboard
-            // values at 0 to avoid double-applying. On TOP of the kYawOutDeg term.
-            float kRotOffXDeg = kBaseRotXDeg;   // baseline; left X (right uses same)
-            float kRotOffYDeg = kBaseRotYDeg;   // baseline; left Y (right negated)
-            static const float kRotOffZDeg =  0.0f;    // left Z (right negated)
-            float rx = kRotOffXDeg * 0.01745329f;
-            float ry = (h == 0 ? kRotOffYDeg : -kRotOffYDeg) * 0.01745329f;
-            float rz = (h == 0 ? kRotOffZDeg : -kRotOffZDeg) * 0.01745329f;
-            Quat qrx = { sinf(rx*0.5f), 0.0f, 0.0f, cosf(rx*0.5f) };
-            Quat qry = { 0.0f, sinf(ry*0.5f), 0.0f, cosf(ry*0.5f) };
-            Quat qrz = { 0.0f, 0.0f, sinf(rz*0.5f), cosf(rz*0.5f) };
-            Quat qRotOff = quatMul(quatMul(qrx, qry), qrz);   // from_euler(XYZ)
-            oq = quatNorm(quatMul(oq, qRotOff));
-            m.pose.orientation = { oq.x, oq.y, oq.z, oq.w };
-            // Grip offset = a FIXED point on the physical controller, so it lives in
-            // the controller's LOCAL frame and must rotate with it. (Was applied in
-            // world space, which kept the offset world-aligned while the controller
-            // rotated -> the reported origin drifted off the real one along whatever
-            // axis you pitched/rolled.) Rotate the local offset by the SAME reported
-            // orientation, then add to the raw tracked position. Local axes (in the
-            // controller's own frame): X = sideways, Y = up/down, Z = front/back.
-            //   +X = toward the controller's RIGHT side   / -X = toward its LEFT
-            //   +Y = up toward the buttons (top face)      / -Y = down toward the trigger
-            //   +Z = back toward the wrist                 / -Z = forward toward the tip
-            // kGripSideLocal is mirrored for the right hand (the two controllers are
-            // mirror images), like kYawOutDeg above; the other two apply to both hands.
-            float kGripSideMm = kBaseGripSideMm, kGripUpMmV = kBaseGripUpMm, kGripBackMmV = kBaseGripBackMm;
-            float kGripSideLocal = kGripSideMm * 0.001f;  // baseline; X
-            float kGripUpLocal   = kGripUpMmV  * 0.001f;  // Y
-            float kGripBackLocal = kGripBackMmV * 0.001f; // Z
-            float sideSign = (h == 0) ? +1.0f : -1.0f;    // mirror X on the right hand
-            float gripLocal[3] = { kGripSideLocal * sideSign, kGripUpLocal, kGripBackLocal };
-            // ROT SWING: split the offset into an ORBITING part (rotated by the full
-            // controller orientation -> swings with pitch/roll, the felt pivot sits
-            // at the SDK tracked point) and a LEVEL part (rotated by heading ONLY ->
-            // stays gravity-level, so the controller spins more in place). swing=1 is
-            // fully rigid (old behavior); swing=0 removes pitch/roll orbit. At a level,
-            // forward pose the two frames coincide, so the rest position is unchanged.
-            float swing = kBaseRotSwing;   // baseline
-            if (swing < 0.0f) swing = 0.0f; else if (swing > 1.0f) swing = 1.0f;
-            // Heading-only quaternion = twist of oq about the up (Y) axis (swing-twist).
-            float yn = sqrtf(oq.y*oq.y + oq.w*oq.w);
-            Quat oqYaw = (yn > 1e-6f) ? Quat{ 0.0f, oq.y/yn, 0.0f, oq.w/yn }
-                                      : Quat{ 0.0f, 0.0f, 0.0f, 1.0f };
-            float gripOrbit[3] = { gripLocal[0]*swing,        gripLocal[1]*swing,        gripLocal[2]*swing };
-            float gripLevel[3] = { gripLocal[0]*(1.0f-swing), gripLocal[1]*(1.0f-swing), gripLocal[2]*(1.0f-swing) };
-            float wOrbit[3], wLevel[3];
-            quatRotateVec(oq,    gripOrbit, wOrbit);
-            quatRotateVec(oqYaw, gripLevel, wLevel);
-            float gripWorld[3] = { wOrbit[0]+wLevel[0], wOrbit[1]+wLevel[1], wOrbit[2]+wLevel[2] };
-            float wpx = cs[h].pos[0]*0.001f + gripWorld[0];
-            float wpy = cs[h].pos[1]*0.001f + gripWorld[1];
-            float wpz = cs[h].pos[2]*0.001f + gripWorld[2];
-            m.pose.position[0] = wpx;
-            m.pose.position[1] = wpy;
-            m.pose.position[2] = wpz;
-            // Angular velocity: hardware gyro, re-expressed into the converted pose
-            // frame. The pose orientation is conjugated by a 180deg Z flip (the
-            // (-x,-y,z,w) mapping), so a world-frame angular-velocity vector maps the
-            // same way: (wx,wy,wz) -> (-wx,-wy,wz). Forwarding it raw would fight the
-            // converted pose during fast turns.
-            // Prediction strength: the server extrapolates pose + velocity*dt, so
-            // scaling the reported velocities scales the prediction reach. 0.75 backs
-            // off ~25%, the raw rates overshoot on quick stops/flicks.
-            float kCtrlPredict = kBasePredict;   // baseline
-            if (kCtrlPredict < 0.0f) kCtrlPredict = 0.0f; else if (kCtrlPredict > 1.0f) kCtrlPredict = 1.0f;
-            // Angular velocity: hardware gyro re-expressed into the converted pose
-            // frame (-wx,-wy,wz to match the (-x,-y,z,w) orientation flip). This SAME
-            // omega also drives the grip lever's linear velocity below, so position
-            // and rotation extrapolate by exactly the same amount (no shear).
-            float omega[3] = { -cs[h].angVel[0], -cs[h].angVel[1], cs[h].angVel[2] };
-            m.angular_velocity[0] = omega[0] * kCtrlPredict;
-            m.angular_velocity[1] = omega[1] * kCtrlPredict;
-            m.angular_velocity[2] = omega[2] * kCtrlPredict;
-            // Linear velocity = velocity of the Pico CENTER + omega x lever. The
-            // center term is differentiated (smoothed); the lever-swing term is
-            // computed ANALYTICALLY from the same omega we send, so the rotation
-            // prediction and the lever's positional prediction stay locked together
-            // (numerically differentiating the whole position incl. the lever would
-            // lag the crisp gyro rotation and shear the rigid body during fast turns).
-            float leverVel[3] = {
-                omega[1]*wOrbit[2] - omega[2]*wOrbit[1],
-                omega[2]*wOrbit[0] - omega[0]*wOrbit[2],
-                omega[0]*wOrbit[1] - omega[1]*wOrbit[0],
-            };
-            float cx = cs[h].pos[0]*0.001f, cy = cs[h].pos[1]*0.001f, cz = cs[h].pos[2]*0.001f;
-            bool ctrlNew = !ctrlHavePrev[h] ||
-                cs[h].pos[0]!=ctrlRawP[h][0] || cs[h].pos[1]!=ctrlRawP[h][1] ||
-                cs[h].pos[2]!=ctrlRawP[h][2];
-            if (ctrlNew) {
-                if (ctrlHavePrev[h]) {
-                    double dt = (double)(ts - ctrlPrevTs[h]) * 1e-9;
-                    if (dt > 0.002 && dt < 0.05) {
-                        // tau=0.05s: light smoothing (~one CV sample period) on the
-                        // center translation, the lever term is unfiltered (analytic).
-                        const float a = 1.0f - expf(-(float)dt / 0.05f);
-                        float lvx = (float)((cx - ctrlPrevP[h][0]) / dt);
-                        float lvy = (float)((cy - ctrlPrevP[h][1]) / dt);
-                        float lvz = (float)((cz - ctrlPrevP[h][2]) / dt);
-                        ctrlFLin[h][0] += (lvx - ctrlFLin[h][0]) * a;
-                        ctrlFLin[h][1] += (lvy - ctrlFLin[h][1]) * a;
-                        ctrlFLin[h][2] += (lvz - ctrlFLin[h][2]) * a;
-                    }
-                }
-                ctrlPrevP[h][0]=cx; ctrlPrevP[h][1]=cy; ctrlPrevP[h][2]=cz;
-                ctrlPrevTs[h]=ts; ctrlHavePrev[h]=true;
-                ctrlRawP[h][0]=cs[h].pos[0]; ctrlRawP[h][1]=cs[h].pos[1]; ctrlRawP[h][2]=cs[h].pos[2];
-            }
-            m.linear_velocity[0] = (ctrlFLin[h][0] + leverVel[0]) * kCtrlPredict;
-            m.linear_velocity[1] = (ctrlFLin[h][1] + leverVel[1]) * kCtrlPredict;
-            m.linear_velocity[2] = (ctrlFLin[h][2] + leverVel[2]) * kCtrlPredict;
-        }
-        if ((tframe % 38) == 0) {
-            for (int h = 0; h < 2; h++) {
-                if (!cs[h].fresh || cs[h].conn != 1) continue;
-                LOGI("CTRLALIGN head p=(%.3f,%.3f,%.3f) q=(%.3f,%.3f,%.3f,%.3f) | hand%d RAW pmm=(%.0f,%.0f,%.0f) q=(%.3f,%.3f,%.3f,%.3f)",
-                     px, py, pz, qx, qy, qz, qw,
-                     h, cs[h].pos[0], cs[h].pos[1], cs[h].pos[2],
-                     cs[h].q[0], cs[h].q[1], cs[h].q[2], cs[h].q[3]);
-            }
-        }
-
-        // Send pose+gaze every kUplinkDiv-th step (~150Hz); the filters above
-        // already stepped this iteration regardless, so decimating only the SEND
-        // keeps them rate-stable while halving the uplink packet rate.
-        bool doUplink = (tframe % kUplinkDiv) == 0;
-
-        // Forward eye blink (per-eye openness) once eye tracking has data. The
-        // openness is latched to be sent with the NEXT alvr_send_tracking, so only
-        // push it on uplink steps (the smoothing itself still runs every iteration).
-        if (gEyeHaveOpen) {
-            // dt-normalized blink smoothing (tau=0.011s ~= alpha 0.70 at 72Hz).
-            static uint64_t sBlinkPrevTs = 0;
-            float kBlinkAlpha = 1.0f;
-            if (sBlinkPrevTs != 0) {
-                double bdt = (double)(ts - sBlinkPrevTs) * 1e-9;
-                if (bdt > 0.0 && bdt < 0.05) kBlinkAlpha = 1.0f - expf(-(float)bdt / 0.011f);
-            }
-            sBlinkPrevTs = ts;
-            gEyeOpenSmooth[0] += (gEyeOpen[0] - gEyeOpenSmooth[0]) * kBlinkAlpha;
-            gEyeOpenSmooth[1] += (gEyeOpen[1] - gEyeOpenSmooth[1]) * kBlinkAlpha;
-            if (doUplink) alvr_send_eye_openness(gEyeOpenSmooth[0], gEyeOpenSmooth[1]);
-        }
-        if (doUplink) alvr_send_tracking(ts, motions, motionCount, nullptr,
-                                         (const struct AlvrPose *const *)eyeGazes);
-
-        // ---- Controller buttons: send only on CHANGE (edge) ------------------
-        auto sendBinEdge = [&](int h, int i, uint64_t id, bool v) {
-            if (binInit[h] && lastBin[h][i] == v) return;
-            lastBin[h][i] = v;
-            AlvrButtonValue b; b.tag = ALVR_BUTTON_VALUE_BINARY; b.binary = v;
-            alvr_send_button(id, b);
-        };
-        auto sendScalEdge = [&](int h, int i, uint64_t id, float v) {
-            if (scalInit[h] && lastScal[h][i] == v) return;
-            lastScal[h][i] = v;
-            AlvrButtonValue b; b.tag = ALVR_BUTTON_VALUE_SCALAR; b.scalar = v;
-            alvr_send_button(id, b);
-        };
-        // Thumbstick response curve. The Neo 2 stick reports LINEARLY, which feels
-        // touchy: a small deflection already commands a big value, so locomotion
-        // ramps up fast. Reshape with an expo (blend of cubic + linear) so small
-        // inputs are gentle while full throw still reaches 1.0. Plus a center
-        // deadzone (resting drift) AND an outer saturation band: the stick can't
-        // physically reach its reported max, so the last kStickOuter of travel is
-        // dead, clamp anything past (1 - kStickOuter) to full 1.0 and rescale the
-        // ramp into the usable [kStickDead, 1 - kStickOuter] band. Tuning:
-        //   kStickExpo  0=linear .. 1=pure cubic (more = more relaxed near center)
-        //   kStickDead  fraction of travel ignored at center
-        //   kStickOuter fraction of travel at the edge that all reads as 100%
-        static const float kStickExpo  = 0.6f;
-        static const float kStickDead  = 0.06f;
-        static const float kStickOuter = 0.20f;
-        // Inferred-touch threshold: no capacitive pad on these sticks, so treat any
-        // deflection past this radius as "finger on the stick". Kept just under
-        // kStickDead so touch always latches before locomotion starts moving.
-        static const float kStickTouch = 0.05f;
-        auto stickCurve = [](float x) -> float {
-            float s = (x < 0.0f) ? -1.0f : 1.0f;
-            float a = fabsf(x); if (a > 1.0f) a = 1.0f;
-            if (a <= kStickDead) return 0.0f;
-            float top = 1.0f - kStickOuter;
-            if (a >= top) return s * 1.0f;                 // outer band -> full deflection
-            a = (a - kStickDead) / (top - kStickDead);     // rescale usable travel to [0,1]
-            float curved = kStickExpo * (a*a*a) + (1.0f - kStickExpo) * a;
-            return s * curved;
-        };
-        for (int h = 0; h < 2 && !inLobby; h++) {
-            if (!cs[h].fresh || cs[h].conn != 1 || cs[h].keyCount < 10 || staleSkip[h]) continue;
-            const int *k = cs[h].keys;
-            if (k[2]||k[3]||k[4]||k[5]||k[6]||k[7])
-                LOGI("BTN[%d] trig=%d grip=%d joyClk=%d menu=%d A/X=%d B/Y=%d (joy %d,%d trigA=%d gripA=%d)",
-                     h, k[2],k[3],k[4],k[5],k[6],k[7], k[0],k[1],k[8],k[9]);
-            // The stick reports a SQUARE range: a full diagonal gives x~1 AND y~1,
-            // a vector of radius sqrt(2). SteamVR expects a CIRCULAR stick (radius
-            // <= 1), so trim the square corners to the unit circle, clamp the
-            // post-curve vector's magnitude to 1 (cardinals untouched; only the
-            // diagonal corner is pulled in to the rim). The per-axis response curve
-            // above (deadzone/expo/outer band) is preserved.
-            float stx = stickCurve((k[0] - 128) / 128.0f);
-            float sty = stickCurve((k[1] - 128) / 128.0f);
-            float mag2 = stx*stx + sty*sty;
-            if (mag2 > 1.0f) { float inv = 1.0f / sqrtf(mag2); stx *= inv; sty *= inv; }
-            sendScalEdge(h, 0, alvrBtn[h].thumbX, stx);
-            sendScalEdge(h, 1, alvrBtn[h].thumbY, sty);
-            float trig = k[8] / 255.0f; if (trig < 0) trig = 0; if (trig > 1) trig = 1;
-            sendScalEdge(h, 2, alvrBtn[h].trigVal, trig);
-            float grip = k[9] / 255.0f; if (grip < 0) grip = 0; if (grip > 1) grip = 1;
-            if (grip == 0.0f && k[3]) grip = 1.0f;
-            sendScalEdge(h, 3, alvrBtn[h].gripVal, grip);
-            sendBinEdge(h, 0, alvrBtn[h].thumbClick, k[4] != 0);
-            // Inferred stick touch: deflection past kStickTouch, or a click (which is
-            // physically a press, so the finger is certainly on it). Uses the RAW
-            // radius, not the post-curve stx/sty, so the deadzone doesn't hide it.
-            float rx = (k[0] - 128) / 128.0f, ry = (k[1] - 128) / 128.0f;
-            bool  stickTouched = (rx*rx + ry*ry) > (kStickTouch * kStickTouch) || k[4] != 0;
-            sendBinEdge(h, 4, alvrBtn[h].thumbTouch, stickTouched);
-            sendBinEdge(h, 1, alvrBtn[h].menu,       k[5] != 0);
-            sendBinEdge(h, 2, alvrBtn[h].face1,      k[6] != 0);
-            sendBinEdge(h, 3, alvrBtn[h].face2,      k[7] != 0);
-            binInit[h] = true;
-            scalInit[h] = true;
-        }
-
         tframe++;
         // Advance the absolute deadline by exactly one period and sleep to it. If
         // we overran (deadline already past), re-anchor to now instead of firing a
-        // catch-up burst of zero-length iterations (which would spike the uplink rate
-        // and inject tiny-dt samples into the EMA filters).
+        // catch-up burst of zero-length iterations.
         tsAddNs(nextTick, kPeriodNs);
         struct timespec nowT;
         clock_gettime(CLOCK_MONOTONIC, &nowT);
@@ -2086,13 +1497,9 @@ void *renderThread(void *) {
     gGazeVao = 0; gGazeVbo = 0;
     gGazeVertCount = 0;
 
-    // Stream / foveation state
-    gFoveOn = false;
-    gFovResyncPending = false;
+    // Stream state
     gResetPacer = false;
     gStreaming = false;
-    gDecoderReady = false;
-    gAlvrGlReady = false;
     gSlept = false;
 
     // Passthrough and simple_lobby: their init() guards on a bool that survives
@@ -2116,7 +1523,6 @@ void *renderThread(void *) {
     };
     EGLConfig cfg; EGLint n = 0;
     eglChooseConfig(dpy, cfgAttribs, &cfg, 1, &n);
-    const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     // EGL_IMG_context_priority: the GPU scheduler preempts in favour of higher-
     // priority contexts. The async warp present is time-critical, so it gets HIGH;
     // our render/encode work gets LOW so the GPU yields to the warp. Best-effort:
@@ -2131,7 +1537,7 @@ void *renderThread(void *) {
         EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_LOW_IMG, EGL_NONE };
     const EGLint ctxAttribsHigh[] = { EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_HIGH_IMG, EGL_NONE };
-    EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctxAttribs);
+    EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctxAttribsLow);
 
     // SDK init + GL resources are created once on a tiny pbuffer so the GL context
     // is valid before the first window surface exists. They survive surface
@@ -2149,7 +1555,7 @@ void *renderThread(void *) {
          initRc, sensRc, startRc);
     // Detect Neo 2 EYE support but leave IR illuminators OFF for now. We only light
     // them up once a stream connects with the server's Face Tracking eye source
-    // enabled. See applyServerEyeTracking() on STREAMING_STARTED/STOPPED.
+    // enabled. See applyServerEyeTracking() on stream start/stop.
     initEyeTrackingMode();
     refreshDeviceIp();   // prime the lobby HUD IP (also re-read periodically in lobby)
     readHeadsetModel(env);
@@ -2173,33 +1579,16 @@ void *renderThread(void *) {
     if (g_stream)
         g_stream->tracker.floor_relative.store(true);
 
-    // Capture the play-area extents (meters) before tearing the boundary system
-    // down, forwarded to SteamVR as the chaperone once a stream starts.
-    if (guardian) {
-        float bx = 0, by = 0, bz = 0;
-        int n = Pvr_BoundaryGetDimensions(&bx, &by, &bz, true /* play area */);
-        if (n > 0 && bx > 0.05f && bz > 0.05f) {
-            gPlayspaceW = bx; gPlayspaceD = bz;
-        }
-        LOGI("boundary configured: dims=%.2fx%.2f (n=%d) -> playspace %.2fx%.2f",
-             bx, bz, n, gPlayspaceW, gPlayspaceD);
-    } else {
-        LOGI("boundary not configured; no playspace to forward");
-    }
-
     Pvr_DisableBoundary();
     Pvr_ShutdownSDKBoundary();
 
     // Render IPD = world-scale knob, user-adjustable in the lobby (gSoftIpdMm,
     // persisted). softIpdM() is the live value used by the lobby render, the warp
-    // submit pose, and the ALVR view_params.
+    // submit pose, and the tracker's eye views.
     LOGI("render IPD = %.4f m (software, adjustable); device reports %.4f",
          softIpdM(), Pvr_GetIPD());
 
-    // ---- ALVR client_core init -------------------------------------------
-    // Context must be the Activity; JavaVM from JNI. After this the client
-    // searches for an ALVR PC server on the LAN (mDNS) and connects.
-    setHomeFromFilesDir(env, gActivity);   // before any ALVR storage access
+    setHomeFromFilesDir(env, gActivity);   // config files land under $HOME
     loadAllConfig();                        // restore ALL persisted settings
     // Apply the persisted STREAM FOV to the SDK before the warp thread is created
     // (at the first surface's EV_InitRenderThread), so the warp builds its
@@ -2220,94 +1609,6 @@ void *renderThread(void *) {
         }
     }
     pushEqGains();                          // apply the restored EQ to the DSP
-    LOGI("alvr: calling initialize_logging"); alvr_initialize_logging();
-    LOGI("alvr: calling initialize_android_context");
-    alvr_initialize_android_context((void *) gVM, (void *) gActivity);
-    LOGI("alvr: android_context done");
-    // RECORD_AUDIO is a runtime permission on Android 10; without it the mic-to-PC
-    // stream stays silent on a fresh install.
-    alvr_try_get_permission("android.permission.RECORD_AUDIO");
-    // Pico Neo 2 panel scans out at exactly 72Hz (HWComposer vsync = 13888888 ns).
-    // There is NO 75Hz mode in the display stack. Advertise only the real native rate.
-    const float kRefreshRates[] = { 72.0f };
-    AlvrClientCapabilities caps = {};
-    // SQUARE per-eye render -> matches the Pico's square eye buffer (1664x1664)
-    // and our square per-eye FOV (101deg H == V). A non-square buffer with a
-    // square FOV squishes content horizontally. The distortion pipeline assumes a
-    // ~square per-eye buffer; reduce decode load via foveated encoding, NOT raw
-    // resolution.
-    caps.default_view_width  = 1664;
-    caps.default_view_height = 1664;
-    caps.refresh_rates       = kRefreshRates;
-    caps.refresh_rates_count = 1;
-    caps.foveated_encoding   = gFoveationEnabled.load();
-    caps.encoder_high_profile= true;
-    caps.encoder_10_bits     = false;
-    caps.encoder_av1         = false;   // SD845 Venus: H.264/HEVC only, no AV1
-    caps.prefer_10bit        = false;
-    caps.prefer_full_range   = true;
-    caps.preferred_encoding_gamma = 1.0f;
-    caps.prefer_hdr          = false;
-    LOGI("alvr: calling initialize"); alvr_initialize(caps);
-    LOGI("alvr: calling resume"); alvr_resume();
-    alvrHeadId = alvr_path_string_to_id("/user/head");
-    alvrHandId[0] = alvr_path_string_to_id("/user/hand/left");
-    alvrHandId[1] = alvr_path_string_to_id("/user/hand/right");
-    LOGI("ALVR initialized + resumed; head id=%llu", (unsigned long long) alvrHeadId);
-    // Controller input path ids (per hand). Neo 2 CV2 = thumbstick wand: trigger,
-    // grip, thumbstick, menu, and two face buttons (A/B right, X/Y left). Path
-    // strings MUST match the ALVR v20 server's Paths.cpp or the button is dropped.
-    const char *kHand[2] = { "/user/hand/left", "/user/hand/right" };
-    for (int h = 0; h < 2; h++) {
-        char p[128];
-        #define PID(f, sfx) snprintf(p,sizeof(p),"%s%s",kHand[h],sfx); alvrBtn[h].f = alvr_path_string_to_id(p)
-        // Paths must match the ALVR server's Quest source profile or the button
-        // is "not mapped" and dropped:
-        //  - grip: squeeze/VALUE only (value auto-derives click via hysteresis).
-        //  - trigger: value only (auto-derives click).
-        //  - menu: menu/click (system/click is never read as a source).
-        PID(trigVal,    "/input/trigger/value");
-        PID(gripVal,    "/input/squeeze/value");
-        PID(thumbX,     "/input/thumbstick/x");
-        PID(thumbY,     "/input/thumbstick/y");
-        PID(thumbClick, "/input/thumbstick/click");
-        // These wands have no capacitive stick, so the runtime never gets a touch
-        // event. Infer touch from deflection (see the send below).
-        PID(thumbTouch, "/input/thumbstick/touch");
-        PID(menu,       "/input/menu/click");
-        // Face buttons: right = a/b, left = x/y (pick per hand).
-        PID(face1, h == 1 ? "/input/a/click" : "/input/x/click");
-        PID(face2, h == 1 ? "/input/b/click" : "/input/y/click");
-        #undef PID
-    }
-
-    // ALVR's GL renderer (wgpu) creates its OWN separate EGL context inside
-    // alvr_initialize_opengl(). It is NOT our context, so GL objects are invisible
-    // across the boundary. Fix: recreate OUR context as a SHARE context of ALVR's,
-    // so texture names are common to both.
-    alvr_initialize_opengl();           // creates + makes current ALVR's GL context
-    EGLContext alvrCtx = eglGetCurrentContext();
-    EGLDisplay alvrDpy = eglGetCurrentDisplay();
-    if (alvrCtx == EGL_NO_CONTEXT) {
-        LOGE("alvr_initialize_opengl left no current context!");
-    } else {
-        if (alvrDpy != EGL_NO_DISPLAY && alvrDpy != dpy) {
-            LOGI("ALVR uses a different EGLDisplay; adopting it for sharing");
-            dpy = alvrDpy;
-            pbuf = eglCreatePbufferSurface(dpy, cfg, pbufAttribs);
-        }
-        EGLContext shared = eglCreateContext(dpy, cfg, alvrCtx, ctxAttribsLow);
-        if (shared == EGL_NO_CONTEXT) {
-            LOGE("eglCreateContext(shared with ALVR) failed 0x%x", eglGetError());
-        } else {
-            eglMakeCurrent(dpy, pbuf, pbuf, shared);
-            eglDestroyContext(dpy, ctx);   // drop the bootstrap context
-            ctx = shared;
-            LOGI("created shared GL context %p (shares ALVR ctx %p)", shared, alvrCtx);
-        }
-    }
-    gAlvrGlReady = true;
-    LOGI("alvr_initialize_opengl done");
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
@@ -2357,12 +1658,12 @@ void *renderThread(void *) {
     // deleting them out from under it corrupts the warp ring and crashes. Wait until
     // the warp ring (4 entries) has cycled to fresh stream textures before freeing.
     int  lobbyFreeDelay = -1;
+    bool streamWasUp = false;   // edge detector for stream connect/disconnect
 
-    // Spin up the fixed-rate tracking thread now that the SDK + ALVR are
-    // initialized and the path ids are populated.
+    // Spin up the fixed-rate tracking thread now that the SDK is initialized.
     gTrackRunning.store(true);
     pthread_create(&gTrackThread, nullptr, trackingThread, nullptr);
-    LOGI("tracking thread started (~300Hz fixed-rate uplink)");
+    LOGI("tracking thread started (~300Hz fixed-rate)");
 
     while (gRunning.load()) {
         // Wall-clock at the top of EVERY iteration, used by the video submit path's
@@ -2431,8 +1732,8 @@ void *renderThread(void *) {
                             {
                                 // HW COMPOSITOR PATH: let the warp thread own the
                                 // WINDOW (direct low-latency present) but on its OWN
-                                // context that SHARES our (and ALVR's) textures, so
-                                // it can sample the eye textures we feed it.
+                                // context that SHARES our textures, so it can
+                                // sample the eye textures we feed it.
                                 warpCtx = eglCreateContext(dpy, cfg, ctx, ctxAttribsHigh);  // SHARE ours, HIGH prio
                                 { EGLint pr = -1; eglQueryContext(dpy, warpCtx, EGL_CONTEXT_PRIORITY_LEVEL_IMG, &pr);
                                   LOGI("warpCtx priority level = 0x%x (HIGH=0x%x)", pr, EGL_CONTEXT_PRIORITY_HIGH_IMG); }
@@ -2469,15 +1770,13 @@ void *renderThread(void *) {
         }
 
         // --- proximity power-sleep (don/doff) --------------------------------
-        // Off-head for the timeout -> pause the connection so the server stops
-        // streaming and we tear the decoder down. On don, resume. Edge-triggered.
+        // Off-head for the timeout -> drop to the lobby and tell the server the
+        // headset was removed so it can idle the stream. Edge-triggered.
         {
             bool wantSleep = gSleepReq.load();
             if (wantSleep && !gSlept) {
                 LOGI("proximity: off-head timeout -> pausing stream (power save)");
-                if (gDecoderReady) { alvr_destroy_decoder(); gDecoderReady = false; }
                 gStreaming = false;
-                alvr_pause();
                 if (gPassthrough) gPassthrough->stop();
                 gSlept = true;
                 if (g_stream && g_stream->session)
@@ -2486,7 +1785,7 @@ void *renderThread(void *) {
                             .change_time = g_stream->to_xr_time(g_stream->get_timestamp_ns())});
             } else if (!wantSleep && gSlept) {
                 LOGI("proximity: headset donned -> resuming stream");
-                alvr_resume();
+                gStreaming = wivrn_streaming();
                 if (gPassthrough) gPassthrough->start();
                 gSlept = false;
                 if (g_stream && g_stream->session)
@@ -2593,22 +1892,6 @@ void *renderThread(void *) {
             }
         }
 
-        // Once a decoder exists, find + pin its output-pump thread. The pump spawns
-        // synchronously inside alvr_create_decoder, but pthread_setname lands a beat
-        // later, so retry the /proc scan. Re-armed per decoder. Throttled to every 8th
-        // frame; ~25 attempts before giving up.
-        if (gStreaming && gDecoderReady && !gDecoderPinned && (frame % 8) == 0) {
-            if (pinDecoderThreadForLowLatency(reservedCpu) || ++gDecoderPinTries > 25)
-                gDecoderPinned = true;
-        }
-
-        // Same for the video receive thread (exists once connected, before the decoder).
-        // Re-armed on STREAMING_STARTED; scanned on the same throttled cadence.
-        if (gStreaming && !gVideoRecvPinned && (frame % 8) == 0) {
-            if (pinVideoRecvThreadForLowLatency(reservedCpu) || ++gVideoRecvPinTries > 25)
-                gVideoRecvPinned = true;
-        }
-
         // ---- Head pose read-back (produced by the tracking thread) -----------
         // The render thread reads the pose the tracking thread publishes into
         // gHeadData for the lobby head transform + heartbeat log.
@@ -2630,19 +1913,20 @@ void *renderThread(void *) {
             saveSoftIpd();
             gIpdDirty.store(false);
         }
-        // If the IPD changed while streaming, push fresh view_params so the server
-        // re-renders at the new eye separation without needing a reconnect.
+        // If the IPD changed while streaming, feed the tracker so the next
+        // tracking packet carries the new eye separation.
         if (gStreaming && gSentIpdMm.load() != gSoftIpdMm.load()) {
-            sendViewParams();
             if (g_stream) g_stream->tracker.soft_ipd.store(softIpdM());
-            LOGI("Software IPD changed mid-stream -> resent view_params (%.1f mm)", gSoftIpdMm.load());
+            gSentIpdMm.store(gSoftIpdMm.load());
+            LOGI("Software IPD changed mid-stream -> tracker updated (%.1f mm)", gSoftIpdMm.load());
         }
 
         // ---- FIELD OF VIEW committed (slider released) ----------------------
         // Apply the FOV lever. Writing the SDK globals alone doesn't rebuild the
         // warp's distortion mesh, so re-point the warp (Pause/Init/Resume) to make
-        // the change take effect live; then resend view_params so the server renders
-        // the new cone at the same FOV the warp now maps. Only fires on slider release.
+        // the change take effect live. The server always renders the fixed cone
+        // the tracker advertises; this only changes the local warp mapping.
+        // Only fires on slider release.
         if (gFovDirty.exchange(false)) {
             float eff = gStreamFovDeg.load();
             writeSdkFov(eff);
@@ -2655,7 +1939,6 @@ void *renderThread(void *) {
                 gAtwEnabled = false;       // re-enable ATW on the next submit
                 LOGI("FIELD OF VIEW: warp re-pointed at %.1f deg", eff);
             }
-            if (gStreaming) sendViewParams();   // server renders the new cone
             saveStreamFov();
             LOGI("FIELD OF VIEW applied: %.1f deg", eff);
         }
@@ -2664,250 +1947,75 @@ void *renderThread(void *) {
         // crossing. Covers both the stream + lobby paths.
         pollBatteryWarn();
 
-        // ---- ALVR: drain events --------------------------------------------
-        AlvrEvent ev;
-        while (alvr_poll_event(&ev)) {
-            if (ev.tag == ALVR_EVENT_HUD_MESSAGE_UPDATED) {
-                char msg[1024] = {0};
-                alvr_hud_message_bounded(msg, sizeof(msg));   // never overflows; NUL-terminated within cap
-                LOGI("ALVR event HUD_MESSAGE_UPDATED: %s", msg);
-                // Map ALVR's HUD message to a short lobby status. Prefix-match
-                // the whole word so "Disconnected" doesn't trip "Connect".
-                auto startsWith = [](const char *s, const char *pre) {
-                    while (*pre) { if (*s++ != *pre++) return false; } return true;
-                };
-                if (startsWith(msg, "Connect"))     setStrBounded(gStatusText, "Connecting", sizeof(gStatusText));
-                else if (startsWith(msg, "Search")) setStrBounded(gStatusText, "Searching", sizeof(gStatusText));
-                else if (msg[0] == 0)               setStrBounded(gStatusText, "Disconnected", sizeof(gStatusText));
-                // ALVR prints "hostname: XXXX.client", parse it for the lobby HUD.
-                const char *hn = strstr(msg, "hostname:");
-                if (hn) {
-                    hn += 9;
-                    while (*hn == ' ' || *hn == '\t') hn++;
-                    int i = 0;
-                    while (*hn && *hn != '\n' && *hn != '\r' && i < (int)sizeof(gHostnameText)-1)
-                        gHostnameText[i++] = *hn++;
-                    gHostnameText[i] = 0;
+        // ---- WiVRn stream state edges -------------------------------------
+        // Watch the streaming_client flags directly and run the start/stop
+        // handling on each transition.
+        bool streamUp = wivrn_streaming();
+        if (streamUp && !streamWasUp) {
+            int vw = 0, vh = 0;
+            wivrn_stream_resolution(&vw, &vh);
+            gStreamW = (uint32_t) vw;
+            gStreamH = (uint32_t) vh;
+            gRefreshHint = wivrn_stream_framerate();
+            if (gRefreshHint <= 0.0f) gRefreshHint = 72.0f;
+            if (g_stream)
+                setStrBounded(gHostnameText, g_stream->server_host.c_str(), sizeof(gHostnameText));
+            LOGI("stream started %ux%u @%.0fHz host=%s", gStreamW, gStreamH, gRefreshHint, gHostnameText);
+            if (gStreamW > 0) {
+                // Create the swapchain at EYE dimensions, not the server's stream
+                // dimensions. The PVR warp's distortion mesh is built for the eye
+                // buffer resolution; a larger swapchain leaves black borders.
+                uint32_t swapW = gStreamW, swapH = gStreamH;
+                if (g_stream) {
+                    int ew = g_stream->eye_width.load();
+                    int eh = g_stream->eye_height.load();
+                    if (ew > 0 && eh > 0) { swapW = ew; swapH = eh; }
                 }
-            } else if (ev.tag == ALVR_EVENT_STREAMING_STARTED) {
-                gStreamW = ev.STREAMING_STARTED.view_width;
-                gStreamH = ev.STREAMING_STARTED.view_height;
-                gRefreshHint = ev.STREAMING_STARTED.refresh_rate_hint;
-                LOGI("ALVR STREAMING_STARTED %ux%u @%.0fHz fov-enc=%d hdr=%d",
-                     gStreamW, gStreamH, ev.STREAMING_STARTED.refresh_rate_hint,
-                     ev.STREAMING_STARTED.enable_foveated_encoding,
-                     ev.STREAMING_STARTED.enable_hdr);
-                // Read the server's foveation params from settings JSON so our
-                // de-foveation matches the server. Gated on enable_foveated_encoding.
-                bool foveOn = ev.STREAMING_STARTED.enable_foveated_encoding;
-                float foCsx=0, foCsy=0, foShx=0, foShy=0, foErx=0, foEry=0;
-                if (foveOn) {
-                    float fp[6]; readFoveationParams(fp);
-                    foCsx=fp[0]; foCsy=fp[1]; foShx=fp[2]; foShy=fp[3]; foErx=fp[4]; foEry=fp[5];
-                    LOGI("foveation ON: center=(%.3f,%.3f) shift=(%.3f,%.3f) edge=(%.2f,%.2f)",
-                         foCsx, foCsy, foShx, foShy, foErx, foEry);
-                }
-                // Cache the params so a later mid-session foveation change can be
-                // detected + re-synced (see REAL_TIME_CONFIG).
-                gFoveOn = foveOn;
-                gFovParams[0]=foCsx; gFovParams[1]=foCsy; gFovParams[2]=foShx;
-                gFovParams[3]=foShy; gFovParams[4]=foErx; gFovParams[5]=foEry;
-                gFovResyncPending = false;   // fresh stream -> drop any stale pending re-sync
-                // Defensive: if a reconnect arrives without a STREAMING_STOPPED,
-                // drop the stale decoder so the DECODER_CONFIG rebuilds it fresh.
-                if (gDecoderReady) { alvr_destroy_decoder(); gDecoderReady = false; }
-                // createStreamSwapchain below allocates new textures + resets the
-                // pipeline, so no stale slot is handed to the warp on reconnect.
-                if (gAlvrGlReady && gStreamW > 0) {
-                    // Create the swapchain at EYE dimensions, not the server's stream
-                    // dimensions. The PVR warp's distortion mesh is built for the eye
-                    // buffer resolution; a larger swapchain leaves black borders.
-                    uint32_t swapW = gStreamW, swapH = gStreamH;
-                    if (g_stream) {
-                        int ew = g_stream->eye_width.load();
-                        int eh = g_stream->eye_height.load();
-                        if (ew > 0 && eh > 0) { swapW = ew; swapH = eh; }
-                    }
-                    createStreamSwapchain(swapW, swapH);
-                    const uint32_t *swapArr[2] = { gSwap[0], gSwap[1] };
-                    AlvrStreamConfig sc = {};
-                    sc.view_resolution_width  = swapW;
-                    sc.view_resolution_height = swapH;
-                    sc.swapchain_textures = (const uint32_t **) swapArr;
-                    sc.swapchain_length   = kSwapLen;
-                    sc.enable_foveation        = foveOn;
-                    sc.foveation_center_size_x = foCsx;
-                    sc.foveation_center_size_y = foCsy;
-                    sc.foveation_center_shift_x= foShx;
-                    sc.foveation_center_shift_y= foShy;
-                    sc.foveation_edge_ratio_x  = foErx;
-                    sc.foveation_edge_ratio_y  = foEry;
-                    sc.enable_upscaling   = false;
-                    alvr_start_stream_opengl(sc);
-                    // Tell the server our per-eye FOV (~101deg) + current Software IPD.
-                    sendViewParams();
-                    gSwapIdx = 0;
-                    gStreaming = true;
-                    // Sync the tracker's soft_ipd from gSoftIpdMm so the server and
-                    // PVR warp use the same IPD (avoids stereo mismatch).
-                    if (g_stream) g_stream->tracker.soft_ipd.store(softIpdM());
-                    // Stream owns the eye buffers now, stop the passthrough camera.
-                    if (gPassthrough) gPassthrough->stop();
-                    gResetPacer = true;          // fresh stream -> reset pacer + video counters
-                    gVideoRecvPinned = false; gVideoRecvPinTries = 0;   // re-arm recv-thread pin
-                    gManualLobby.store(false);   // start in the stream, not the manual lobby
-                    // Announce a custom interaction profile per hand with the exact
-                    // button set we drive. Includes the RIGHT hand's menu/click,
-                    // which the stock Quest profile lacks, the binder maps right
-                    // menu -> right SYSTEM (SteamVR dashboard).
-                    // NOTE: a custom profile rebuilds the GLOBAL button mapping
-                    // manager from exactly the ids it carries, so it must be sent
-                    // ONCE with BOTH hands' buttons, sending per-hand makes the
-                    // second call wipe the first hand's mappings.
-                    {
-                        uint64_t ids[16] = {
-                            alvrBtn[0].trigVal, alvrBtn[0].gripVal,
-                            alvrBtn[0].thumbX,  alvrBtn[0].thumbY, alvrBtn[0].thumbClick,
-                            alvrBtn[0].menu,    alvrBtn[0].face1,  alvrBtn[0].face2,
-                            alvrBtn[1].trigVal, alvrBtn[1].gripVal,
-                            alvrBtn[1].thumbX,  alvrBtn[1].thumbY, alvrBtn[1].thumbClick,
-                            alvrBtn[1].menu,    alvrBtn[1].face1,  alvrBtn[1].face2,
-                        };
-                        alvr_send_custom_interaction_profile(alvrHandId[0], ids, 16);
-                    }
-                    LOGI("sent custom interaction profile (both hands, incl. right menu->system)");
-                    setStrBounded(gStatusText, "Connected", sizeof(gStatusText));
-                    LOGI("stream renderer ready (%ux%u)", gStreamW, gStreamH);
-                    // Settings JSON is now live: light up the EYE illuminators only if
-                    // the server's Face Tracking eye source is on.
-                    applyServerEyeTracking(true);
-                    // Push the eye-foveation preference once the stream is up so
-                    // the server picks gaze-tracked or fixed-center foveation
-                    // from the start (no extra round-trip after first frame).
-                    if (g_stream) g_stream->send_eye_foveation_override();
-                    // Forward the Pico play area to SteamVR as the chaperone.
-                    // Only if a guardian was set up.
-                    if (gPlayspaceW > 0.0f && gPlayspaceD > 0.0f) {
-                        alvr_send_playspace(gPlayspaceW, gPlayspaceD);
-                        LOGI("sent playspace %.2fx%.2f m", gPlayspaceW, gPlayspaceD);
-                    }
-                }
-            } else if (ev.tag == ALVR_EVENT_DECODER_CONFIG) {
-                if (!gDecoderReady) {
-                    // Cache the config (codec + NAL) so we can rebuild the decoder
-                    // after the manual-lobby pause without a reconnect.
-                    // Bounded copy: alvr_get_decoder_config_bounded never writes past
-                    // sizeof(gDecCfg) and returns the FULL length. An oversized NAL
-                    // is corrupt, REJECT it (don't feed a truncated SPS/PPS to MediaCodec).
-                    uint64_t n = alvr_get_decoder_config_bounded(
-                            (char *) gDecCfg, sizeof(gDecCfg));
-                    if (n > sizeof(gDecCfg)) {
-                        LOGE("decoder config %llu B exceeds %zu B buffer -- rejecting",
-                             (unsigned long long) n, sizeof(gDecCfg));
-                    } else {
-                        gDecCodec = ev.DECODER_CONFIG.codec;
-                        gDecCfgLen = n;
-                        gHaveDecCfg = true;
-                        createVideoDecoder();
-                    }
-                }
-            } else if (ev.tag == ALVR_EVENT_STREAMING_STOPPED) {
-                // Tear the stream down fully so a reconnect rebuilds the decoder +
-                // swapchain from the new config. Without this, the stale decoder
-                // (old SPS/PPS, maybe old resolution) decodes the new stream -> garbled.
-                gStreaming = false;
-                gManualLobby.store(false);   // back to the normal disconnected lobby
-                androidUiPushDiagOverlayOnly(false);  // diag overlay off when not streaming
-                gHaveDecCfg = false;         // stale config; next stream sends a fresh one
-                setStrBounded(gStatusText, "Disconnected", sizeof(gStatusText));
-                if (gDecoderReady) { alvr_destroy_decoder(); gDecoderReady = false; }
-                destroyStreamSwapchain();   // also resets the pipeline (no stale slot)
-                gFovResyncPending = false;   // drop any pending re-sync for the dead stream
-                applyServerEyeTracking(false);       // stream gone -> turn the IR off
-                // Back in the lobby, restart the passthrough camera.
-                if (gPassthrough && gWivrnPassthrough.load()) gPassthrough->start();
-                LOGI("ALVR STREAMING_STOPPED -> decoder+swapchain torn down");
-            } else if (ev.tag == ALVR_EVENT_REAL_TIME_CONFIG) {
-                // The server changed a live setting mid-session. Check for a
-                // foveation change: our de-foveation params are baked at
-                // StreamingStarted, so if the server re-foveated without a full
-                // restart the eyes misalign (stale FFR map). Re-read the params and
-                // rebuild the de-foveation pipeline in place if they moved.
-                if (gStreaming && gAlvrGlReady && gFoveOn && gStreamW > 0) {
-                    float np[6]; readFoveationParams(np);
-                    bool changedVsApplied = false;
-                    for (int i = 0; i < 6; i++)
-                        if (fabsf(np[i] - gFovParams[i]) > 1e-4f) changedVsApplied = true;
-                    if (changedVsApplied) {
-                        // DEFER the rebuild, stash the latest params + reset the
-                        // settle timer. The loop applies one rebuild once these stop
-                        // changing for kFovDebounceNs, so a slider drag's burst of
-                        // events = a single swapchain realloc.
-                        memcpy(gFovPending, np, sizeof(gFovPending));
-                        gFovPendingNs = nowNs();
-                        gFovResyncPending = true;
-                        LOGI("REAL_TIME_CONFIG: foveation change pending center=(%.3f,%.3f) "
-                             "shift=(%.3f,%.3f) edge=(%.2f,%.2f) -> debounced %llums",
-                             np[0],np[1],np[2],np[3],np[4],np[5],
-                             (unsigned long long)(kFovDebounceNs/1000000ULL));
-                    } else {
-                        // Matches what's applied -> cancel any pending rebuild.
-                        gFovResyncPending = false;
-                        LOGI("REAL_TIME_CONFIG: no foveation change");
-                    }
-                } else {
-                    LOGI("ALVR event REAL_TIME_CONFIG (not streaming / no foveation)");
-                }
-            } else if (ev.tag == ALVR_EVENT_HAPTICS) {
-                // Server-driven controller rumble. Map device_id -> hand and park
-                // the pulse; the Java ControllerClient poller drains it.
-                uint64_t did = ev.HAPTICS.device_id;
-                int hand = (did == alvrHandId[1]) ? 1 : (did == alvrHandId[0]) ? 0 : -1;
-                if (hand >= 0)
-                    queueHaptic(hand, ev.HAPTICS.amplitude, ev.HAPTICS.frequency,
-                                ev.HAPTICS.duration_s);
-            } else {
-                LOGI("ALVR event %s", alvrEventName(ev.tag));
+                createStreamSwapchain(swapW, swapH);
+                gSwapIdx = 0;
+                gStreaming = true;
+                // Sync the tracker's soft_ipd from gSoftIpdMm so the server and
+                // PVR warp use the same IPD (avoids stereo mismatch).
+                if (g_stream) g_stream->tracker.soft_ipd.store(softIpdM());
+                // Stream owns the eye buffers now, stop the passthrough camera.
+                if (gPassthrough) gPassthrough->stop();
+                gResetPacer = true;          // fresh stream -> reset pacer + video counters
+                gManualLobby.store(false);   // start in the stream, not the manual lobby
+                setStrBounded(gStatusText, "Connected", sizeof(gStatusText));
+                LOGI("stream renderer ready (%ux%u)", gStreamW, gStreamH);
+                // Stream is up: light the EYE illuminators only if the server's
+                // Face Tracking eye source is on.
+                applyServerEyeTracking(true);
+                // Push the eye-foveation preference once the stream is up so the
+                // server picks gaze-tracked or fixed-center foveation from the
+                // start (no extra round-trip after first frame).
+                if (g_stream) g_stream->send_eye_foveation_override();
             }
+        } else if (!streamUp && streamWasUp) {
+            // Tear the stream down fully so a reconnect rebuilds the swapchain
+            // from the new video description.
+            gStreaming = false;
+            gManualLobby.store(false);   // back to the normal disconnected lobby
+            androidUiPushDiagOverlayOnly(false);  // diag overlay off when not streaming
+            setStrBounded(gStatusText, "Disconnected", sizeof(gStatusText));
+            destroyStreamSwapchain();   // also resets the pipeline (no stale slot)
+            applyServerEyeTracking(false);       // stream gone -> turn the IR off
+            // Back in the lobby, restart the passthrough camera.
+            if (gPassthrough && gWivrnPassthrough.load()) gPassthrough->start();
+            LOGI("stream stopped -> swapchain torn down");
         }
-
-        // Apply a debounced foveation re-sync once the pending params have settled
-        // (no further REAL_TIME_CONFIG change for kFovDebounceNs). Coalesces a slider
-        // drag's burst of events into a single swapchain rebuild. Runs here, right
-        // after the event drain, before the per-frame GL work, so our context is
-        // current.
-        if (gFovResyncPending && gStreaming && gAlvrGlReady && gFoveOn && gStreamW > 0 &&
-            nowNs() - gFovPendingNs > kFovDebounceNs) {
-            applyFoveationResync(gFovPending);
-            gFovResyncPending = false;
-        }
+        streamWasUp = streamUp;
 
         // Handle resolution change from the settings slider: recreate the
-        // swapchain at the new eye dimensions and restart the stream renderer.
+        // swapchain at the new eye dimensions.
         if (g_stream && g_stream->resolution_dirty.exchange(false) &&
-            gStreaming && gAlvrGlReady && gStreamW > 0) {
+            gStreaming && gStreamW > 0) {
             int ew = g_stream->eye_width.load();
             int eh = g_stream->eye_height.load();
             if (ew > 0 && eh > 0) {
                 createStreamSwapchain(ew, eh);
-                const uint32_t *swapArr[2] = { gSwap[0], gSwap[1] };
-                AlvrStreamConfig sc = {};
-                sc.view_resolution_width  = ew;
-                sc.view_resolution_height = eh;
-                sc.swapchain_textures = (const uint32_t **) swapArr;
-                sc.swapchain_length   = kSwapLen;
-                sc.enable_foveation        = gFoveOn;
-                sc.foveation_center_size_x = gFovParams[0];
-                sc.foveation_center_size_y = gFovParams[1];
-                sc.foveation_center_shift_x= gFovParams[2];
-                sc.foveation_center_shift_y= gFovParams[3];
-                sc.foveation_edge_ratio_x  = gFovParams[4];
-                sc.foveation_edge_ratio_y  = gFovParams[5];
-                sc.enable_upscaling   = false;
-                alvr_start_stream_opengl(sc);
                 gSwapIdx = 0;
                 gPrevSwapIdx = -1; gPrevSwapValid = false;
-                sendViewParams();
                 LOGI("resolution change: swapchain recreated at %dx%d", ew, eh);
             }
         }
@@ -2975,7 +2083,7 @@ void *renderThread(void *) {
             gOkClick.store(false);               // swallow any pending click
             LOGI("%s -> manual lobby = %d (stream stays alive)", why, (int)nowLobby);
         };
-        const bool canToggle = gStreaming && gDecoderReady;
+        const bool canToggle = gStreaming && wivrn_stream_ready();
         {
             static uint64_t sideHoldStart = 0;
             if (canToggle && gSideHeld.load() && !gEqGrabbing) {
@@ -3023,9 +2131,9 @@ void *renderThread(void *) {
         // The overlay keeps the decoder running and renders the lobby UI on top
         // of the live video. No pause, no drain, no IDR request on exit.
 
-        // ---- ALVR video path: async TimeWarp (present every refresh) --------
+        // ---- WiVRn video path: async TimeWarp (present every refresh) -------
         // The overlay (gManualLobby) draws on top of the video below.
-        if (gStreaming && gDecoderReady) {
+        if (gStreaming && wivrn_stream_ready()) {
             gStreamingMode.store(true);
             // Servers tab is hidden while streaming; fall back to Settings.
             if (gSettingsCat == 0) gSettingsCat = 1;
@@ -3060,34 +2168,21 @@ void *renderThread(void *) {
             // of the vsync phase at arrival) and place the submit gate a fixed
             // margin after it. The gate chases the drift, so it never sits on
             // the arrival boundary.
-            uint64_t ts = 0; void *hwbuf = nullptr;
-            uint64_t fts = 0; void *fbuf = nullptr; int drained = 0;
-            // BLOCK on the decoder for the first frame instead of busy-polling.
-            // alvr_get_frame_timeout sleeps until a freshly decoded frame arrives
-            // (or the cap elapses), so we wake ~once per frame instead of spinning.
-            // Cap = 1.5 frame intervals: under healthy streaming a frame always
-            // lands within 1, so we wake on the frame; the cap only bounds how
-            // often top-of-loop housekeeping runs when the stream stalls.
-            // Once the first frame is in hand, drain the rest non-blocking to coalesce.
-            //
-            // BUFFER RELEASE: coalescing here does NOT leak or starve the decoder.
-            // Each alvr_get_frame pop_front()s the PREVIOUS call's image first (Rust's
-            // Image::Drop returns that AHardwareBuffer to the ImageReader) then hands
-            // back the next. So every intermediate frame in this drain loop is released
-            // by the very next call; pop_front() IS the release. The final coalesced
-            // hwbuf stays in_use until the NEXT iteration's first dequeue, by which
-            // point alvr_render_stream_opengl below has already consumed it.
-            uint64_t blockNs = (uint64_t)(1.5e9f / (gRefreshHint > 1.0f ? gRefreshHint : 72.0f));
-            // ORDERING ASSUMPTION (B3): each alvr_get_frame releases the PREVIOUS
-            // call's image back to the decoder immediately, but the GPU read of that
-            // image is only fenced, not waited. Safe because the Venus decoder takes
-            // >= one frame to recycle+refill a released buffer, longer than our
-            // render takes to drain its GPU work. If this drain is ever reworked to
-            // hold multiple images or the render overruns a frame, add an explicit
-            // fence wait before release.
-            if (alvr_get_frame_timeout(&fts, &fbuf, blockNs)) {
-                ts = fts; hwbuf = fbuf; drained++;
-                while (alvr_get_frame(&fts, &fbuf)) { ts = fts; hwbuf = fbuf; drained++; }
+            // Latest decoded frame index on stream 0. The blit re-fetches the
+            // synced frame pair itself, so we only need the index to know a
+            // frame exists, count decoder output for the VIDEO counters, and
+            // feed the latency tracker. frame_index 0 = nothing decoded yet.
+            uint64_t frameIdx = 0;
+            {
+                auto f = g_stream->get_latest_frame(0);
+                if (f && f->valid) frameIdx = f->frame_index;
+            }
+            static uint64_t sLastFrameIdx = 0;
+            int drained = 0;   // frames pulled since the last submit (skipped + shown)
+            if (frameIdx) {
+                drained = (sLastFrameIdx && frameIdx > sLastFrameIdx)
+                        ? (int)(frameIdx - sLastFrameIdx) : 1;
+                sLastFrameIdx = frameIdx;
             }
 
             // SUBMIT EVERY DECODED FRAME. The warp thread free-runs reprojection
@@ -3130,9 +2225,14 @@ void *renderThread(void *) {
                             sleepUntilMonoNs(nowNs() + (uint64_t)(waitVs * interval));
                         cur = (int64_t) floor(PVR::GetFractionalVsync());
                     }
-                    // Grab any fresher frame that arrived during the wait, so pacing
-                    // only regularises WHEN we present, no extra latency.
-                    while (alvr_get_frame(&fts, &fbuf)) { ts = fts; hwbuf = fbuf; drained++; }
+                    // Count frames that arrived during the wait so pacing only
+                    // regularises WHEN we present, no extra latency. The blit
+                    // below grabs the newest pair itself.
+                    auto f = g_stream->get_latest_frame(0);
+                    if (f && f->valid && f->frame_index > frameIdx) {
+                        drained += (int)(f->frame_index - frameIdx);
+                        frameIdx = f->frame_index;
+                    }
                 }
                 // A miss = this submit ran past the current rate's vsync budget AND
                 // the decoder had a backlog (drained>1 => our fault, not a slow
@@ -3178,18 +2278,6 @@ void *renderThread(void *) {
                     if (_lastStart) { uint64_t g = _tStart - _lastStart; if (g > _mGap) _mGap = g; }
                     _lastStart = _tStart;
                 }
-                AlvrViewParams outVP[2] = {};
-                // Use the current sensor pose as a placeholder for
-                // alvr_report_compositor_start. The actual render pose (from the
-                // server) is read AFTER the blit and stored into gSwapVP.
-                for (int e = 0; e < 2; e++) {
-                    outVP[e].pose.orientation = { qx, qy, qz, qw };
-                    outVP[e].pose.position[0] = px;
-                    outVP[e].pose.position[1] = py;
-                    outVP[e].pose.position[2] = pz;
-                }
-                alvr_report_compositor_start(ts, outVP);
-
                 if (!gAtwEnabled) { Pvr_SetAsyncTimeWarp(1); gAtwEnabled = true;
                     LOGI("HW compositor: async TimeWarp enabled; cfg8(asyncMode)=%d cfg0x19=%d",
                          cfgI(8), cfgI(0x19)); }
@@ -3206,9 +2294,8 @@ void *renderThread(void *) {
                     }
                     PVR_CameraEndFrame(0, gSwap[0][p]);
                     PVR_CameraEndFrame(1, gSwap[1][p]);
-                    if (gSwapFrameTs[p]) {
-                        uint64_t fi = (gSwapFrameTs[p] + 5000) / 10000;
-                        g_latency.on_frame_submitted(fi, 0, nowNs());
+                    if (gSwapFrameIdx[p]) {
+                        g_latency.on_frame_submitted(gSwapFrameIdx[p], 0, nowNs());
                     }
                     // Render-pose baseline for BOTH eyes. Normalize the quat; reuse
                     // last good if degenerate (the warp's SelectRT rejects non-unit
@@ -3218,8 +2305,8 @@ void *renderThread(void *) {
                     static Quat sLastGoodQ[2] = { {0,0,0,1}, {0,0,0,1} };
                     float ipd = softIpdM();
                     for (int e = 0; e < 2; e++) {
-                        Quat q = { gSwapVP[p][e].pose.orientation.x, gSwapVP[p][e].pose.orientation.y,
-                                   gSwapVP[p][e].pose.orientation.z, gSwapVP[p][e].pose.orientation.w };
+                        Quat q = { gSwapVP[p][e].orientation.x, gSwapVP[p][e].orientation.y,
+                                   gSwapVP[p][e].orientation.z, gSwapVP[p][e].orientation.w };
                         float n2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
                         if (n2 > 1e-6f) { q = quatNorm(q); sLastGoodQ[e] = q; }
                         else            { q = sLastGoodQ[e]; }
@@ -3241,42 +2328,32 @@ void *renderThread(void *) {
                 // current frame's fence instead of a frame-old fence that's
                 // already signalled. Under healthy streaming the blit is fast
                 // (<5ms GPU) so the wait returns well within budget.
-                bool firstFrame = !gPrevSwapValid;
                 uint64_t _tEnqStart = diagTiming ? nowNs() : 0;
                 if (diagTiming) { uint64_t e = nowNs(); if (e - _tEnqStart > _mEnq) _mEnq = e - _tEnqStart; }
 
-                AlvrStreamViewParams svp[2];
-                for (int e = 0; e < 2; e++) {
-                    svp[e].swapchain_index = (uint32_t) gSwapIdx;
-                    svp[e].reprojection_rotation = { 0, 0, 0, 1 };
-                    svp[e].fov = outVP[e].fov;
-                }
+                GLuint dstTex[2] = { gSwap[0][gSwapIdx], gSwap[1][gSwapIdx] };
                 uint64_t _tRenderStart = diagTiming ? nowNs() : 0;
-                alvr_render_stream_opengl(hwbuf, svp);   // -> gSwap[e][gSwapIdx] (leaves wgpu ctx current)
+                wivrn_blit_frame_pair(gStreamFbo, dstTex);   // -> gSwap[e][gSwapIdx]
                 if (diagTiming) { _tRender = nowNs(); if (_tRender - _tRenderStart > _mRender) _mRender = _tRender - _tRenderStart; }
 
                 {
-                    // The video is rendered in ALVR's wgpu context. Flush to kick
-                    // off the GPU work, then fence. The submitSlot below does
-                    // glClientWaitSync on the fence, which is the actual GPU
-                    // completion wait. Using glFlush + fence instead of glFinish
-                    // lets the CPU continue (read server poses, set up overlay)
-                    // while the GPU blit runs in parallel.
+                    // Flush to kick off the GPU blit, then fence. The submitSlot
+                    // below does glClientWaitSync on the fence, which is the
+                    // actual GPU completion wait. Using glFlush + fence instead
+                    // of glFinish lets the CPU continue (read server poses, set
+                    // up overlay) while the GPU blit runs in parallel.
                     glFlush();
-                    GLsync alvrFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                    // wgpu made its ctx current; restore ours (offscreen pbuffer; the
-                    // warp owns the window). Textures are shared across the group.
-                    eglMakeCurrent(dpy, pbuf, pbuf, ctx);
-                    // PicoNeo2 fork: NO encode blit. The forked stream shader
-                    // already wrote the final present-domain bytes directly into
-                    // gSwap[e][gSwapIdx], so we feed gSwap straight to the warp.
+                    GLsync blitFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                    // The stream shader already wrote the final present-domain
+                    // bytes directly into gSwap[e][gSwapIdx], so we feed gSwap
+                    // straight to the warp.
                     // Diag HUD is now rendered by the Android UI (WivrnLobbyView).
                     // Low-battery popup active window (5s after a 15%/5% crossing).
                     // Draws into gSwap on OUR ctx, shares the FBO-bind / fence handling.
                     bool warnActive = gBattWarnStartNs.load() != 0 &&
                                       (nowNs() - gBattWarnStartNs.load()) < kBattWarnDurNs;
                     if (warnActive) {
-                        if (alvrFence) { glWaitSync(alvrFence, 0, GL_TIMEOUT_IGNORED); glDeleteSync(alvrFence); alvrFence = 0; }
+                        if (blitFence) { glWaitSync(blitFence, 0, GL_TIMEOUT_IGNORED); glDeleteSync(blitFence); blitFence = 0; }
                         glBindFramebuffer(GL_FRAMEBUFFER, gStreamFbo);
                         glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
                         {
@@ -3432,7 +2509,7 @@ void *renderThread(void *) {
                             g_stream->send_eye_foveation_override();
 
                         // Draw the lobby overlay into gSwap (on top of the video).
-                        if (alvrFence) { glWaitSync(alvrFence, 0, GL_TIMEOUT_IGNORED); glDeleteSync(alvrFence); alvrFence = 0; }
+                        if (blitFence) { glWaitSync(blitFence, 0, GL_TIMEOUT_IGNORED); glDeleteSync(blitFence); blitFence = 0; }
                         glBindFramebuffer(GL_FRAMEBUFFER, gStreamFbo);
                         glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
 
@@ -3488,7 +2565,7 @@ void *renderThread(void *) {
                             androidUiPushDiagOverlayOnly(wantDiagOnly);
                         }
                         if (wantDiagOnly) {
-                            if (alvrFence) { glWaitSync(alvrFence, 0, GL_TIMEOUT_IGNORED); glDeleteSync(alvrFence); alvrFence = 0; }
+                            if (blitFence) { glWaitSync(blitFence, 0, GL_TIMEOUT_IGNORED); glDeleteSync(blitFence); blitFence = 0; }
                             glBindFramebuffer(GL_FRAMEBUFFER, gStreamFbo);
                             glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
                             {
@@ -3548,39 +2625,32 @@ void *renderThread(void *) {
                     if (gSwapFence[gSwapIdx]) glDeleteSync(gSwapFence[gSwapIdx]);
                     if (warnActive || gManualLobby.load() || (gDiagHudMode.load() != 0 && !gManualLobby.load())) {
                         // HUD / battery-popup path: extra work was issued in our ctx,
-                        // ordered after ALVR via glWaitSync; a fresh fence covers it all.
+                        // ordered after the blit via glWaitSync; a fresh fence covers it all.
                         gSwapFence[gSwapIdx] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
                         glFlush();
                     } else {
-                        // No HUD -> our ctx issued NO work this frame, so the ALVR
-                        // render fence IS this slot's fence directly. Skips the
-                        // per-frame glWaitSync + a redundant second fence. (Sync
-                        // objects are shared, so next frame's glClientWaitSync on
-                        // our ctx still works.)
-                        gSwapFence[gSwapIdx] = alvrFence; alvrFence = 0;
+                        // No HUD -> our ctx issued only the blit this frame, so its
+                        // fence IS this slot's fence directly. Skips the per-frame
+                        // glWaitSync + a redundant second fence. (Sync objects are
+                        // shared, so next frame's glClientWaitSync on our ctx still
+                        // works.)
+                        gSwapFence[gSwapIdx] = blitFence; blitFence = 0;
                     }
-                    if (alvrFence) glDeleteSync(alvrFence);   // safety (unreached paths)
+                    if (blitFence) glDeleteSync(blitFence);   // safety (unreached paths)
                     // Stash this frame's render pose with its ring slot. Read the
-                    // server poses AFTER the blit (alvr_render_stream_opengl updates
+                    // server poses AFTER the blit (wivrn_blit_frame_pair updates
                     // gLastServerPoses from the frames it just drew). Using poses
                     // from before the blit would be one frame behind the actual
-                    // frame content, causing the warp to misreproject.
+                    // frame content, causing the warp to misreproject. Fall back to
+                    // the current head pose when the server hasn't sent poses yet.
+                    gSwapVP[gSwapIdx][0].orientation = { qx, qy, qz, qw };
+                    gSwapVP[gSwapIdx][1].orientation = { qx, qy, qz, qw };
                     XrPosef serverPoses[2];
                     if (wivrn_get_server_pose(serverPoses)) {
-                        for (int e = 0; e < 2; e++) {
-                            outVP[e].pose.orientation = {
-                                serverPoses[e].orientation.x,
-                                serverPoses[e].orientation.y,
-                                serverPoses[e].orientation.z,
-                                serverPoses[e].orientation.w };
-                            outVP[e].pose.position[0] = serverPoses[e].position.x;
-                            outVP[e].pose.position[1] = serverPoses[e].position.y;
-                            outVP[e].pose.position[2] = serverPoses[e].position.z;
-                        }
+                        gSwapVP[gSwapIdx][0] = serverPoses[0];
+                        gSwapVP[gSwapIdx][1] = serverPoses[1];
                     }
-                    gSwapVP[gSwapIdx][0] = outVP[0];
-                    gSwapVP[gSwapIdx][1] = outVP[1];
-                    gSwapFrameTs[gSwapIdx] = ts;
+                    gSwapFrameIdx[gSwapIdx] = frameIdx;
                     if (diagTiming) { _tEnc = nowNs(); if (_tEnc - _tEncStart > _mEnc) _mEnc = _tEnc - _tEncStart; }
 
                     // Submit the CURRENT frame's slot now that rendering is done.
@@ -3590,20 +2660,6 @@ void *renderThread(void *) {
                     submitSlot(gSwapIdx, 20000000ULL /* ~20ms: render in flight */);
                     gPrevSwapIdx = gSwapIdx; gPrevSwapValid = true;
                 }
-                // Report the submit->present queue time. GetFractionalVsync()'s
-                // fractional part = progress through the current refresh interval,
-                // so time-to-next-vsync = (1-frac)*interval. Fall back to one
-                // interval if the oracle reads out of range.
-                float interval = 1e9f / (gRefreshHint > 1.0f ? gRefreshHint : 72.0f);
-                double fv = PVR::GetFractionalVsync();
-                double frac = fv - floor(fv);
-                float timeToVsync = (frac >= 0.0 && frac <= 1.0) ? (float)((1.0 - frac) * interval)
-                                                                 : interval;
-                // No +1-frame pipeline: the texture we just rendered for `ts` IS
-                // the one handed to the warp this iteration, so its submit->photon
-                // queue is just the time to the next vsync.
-                float vsyncQ = timeToVsync;
-                alvr_report_submit(ts, (uint64_t) vsyncQ);
                 gSwapIdx = (gSwapIdx + 1) % kSwapLen;
                 // Measure actual decoder output. submits = loop iterations that
                 // presented a fresh frame; decoded = TRUE count of frames pulled
@@ -3696,24 +2752,19 @@ void *renderThread(void *) {
                     _mGap = _mRender = _mEnc = _mEnq = 0;
                 }
             }
-            // alvr_get_frame_timeout blocks on the decoder for up to ~2 frame
-            // intervals, so under healthy streaming the loop is paced by frame
-            // arrival. But when the device falls behind, the NEXT
-            // alvr_get_frame_timeout returns a coalesced burst instantly and the
-            // loop would spin faster than 72Hz. Two warp submits then land inside
-            // one refresh, and the legacy DIATW latches each eye SEPARATELY ->
-            // per-eye pose desync (the video detaches and swims on head turn).
-            // Pace each iteration to >= one vsync so two submits can never share
-            // a refresh. Only bites in the burst case; costs nothing under healthy
-            // streaming. Do NOT target above 72Hz or drop the floor to 0.
+            // The frame poll above never blocks, so without a floor the loop
+            // would spin far past 72Hz. Two warp submits inside one refresh make
+            // the legacy DIATW latch each eye SEPARATELY -> per-eye pose desync
+            // (the video detaches and swims on head turn). Pace each iteration
+            // to >= one vsync so two submits can never share a refresh. Do NOT
+            // target above 72Hz or drop the floor to 0.
             {
                 const uint64_t kVsyncNs = (uint64_t)(1e9 / 72.0);   // 72Hz panel (do NOT exceed)
                 uint64_t now = nowNs();
                 uint64_t iterTime = now - tLoopStart;
-                // If the iteration already consumed >= one vsync (frame wait +
-                // render), don't add another vsync sleep -- that would double the
-                // cycle to ~28ms (36Hz). Go straight to the next
-                // alvr_get_frame_timeout which blocks until the next frame anyway.
+                // If the iteration already consumed >= one vsync (poll + render),
+                // don't add another vsync sleep -- that would double the cycle to
+                // ~28ms (36Hz). Go straight to the next frame poll.
                 if (iterTime < kVsyncNs) {
                     // Iteration was faster than one vsync: sleep the remainder to
                     // prevent spinning faster than 72Hz in the burst case.
@@ -3760,7 +2811,7 @@ void *renderThread(void *) {
         // frame hasn't arrived), show BLACK instead of the lobby UI. The lobby
         // render block still runs (it owns the warp submit path), but we skip
         // drawLobbyScene so the eye textures stay cleared to black.
-        bool showBlack = gStreaming && !gDecoderReady;
+        bool showBlack = gStreaming && !wivrn_stream_ready();
 
         // ---- lobby (pre-stream / between streams): world-locked IP/status/model
         // HUD + floor grid + eye-gaze marker (Neo 2 EYE). Rendered in BOTH render
@@ -4200,12 +3251,6 @@ void *renderThread(void *) {
     // Stop + join the tracking thread before tearing down GL/JVM.
     gTrackRunning.store(false);
     pthread_join(gTrackThread, nullptr);
-    // Tear down the ALVR core in stock order so a later nativeStart re-inits
-    // a clean client: pause the stream, free the GL-side resources while the
-    // context is still current, then destroy the core.
-    alvr_pause();
-    alvr_destroy_opengl();
-    alvr_destroy();
     eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (sfc != EGL_NO_SURFACE) eglDestroySurface(dpy, sfc);
     if (pbuf != EGL_NO_SURFACE) eglDestroySurface(dpy, pbuf);

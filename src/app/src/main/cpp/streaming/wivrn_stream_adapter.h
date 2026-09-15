@@ -20,6 +20,9 @@ bool wivrn_stream_ready();
 // video description has been received and a resolution is known.
 bool wivrn_stream_resolution(int *w, int *h);
 
+// Negotiated stream refresh rate from the video description, or 0 when unknown.
+float wivrn_stream_framerate();
+
 // Blit the latest decoded WiVRn frame for one eye into the currently bound
 // FBO. The caller must have bound the destination framebuffer and viewport.
 // Returns true if a frame was available and blit.
@@ -38,6 +41,11 @@ bool wivrn_blit_eye_frame(int eye,
                           const std::shared_ptr<pico_decoded_frame> & frame,
                           int viewport_w, int viewport_h,
                           XrPosef * out_pose = nullptr);
+
+// Blit the newest synchronized frame pair (same frame index for both eyes)
+// into dst_tex[0]/dst_tex[1] via `fbo`, at eye resolution. Stores the server
+// poses of the blitted frames for wivrn_get_server_pose.
+void wivrn_blit_frame_pair(GLuint fbo, const GLuint dst_tex[2]);
 
 // Server render poses from the last synchronized blit (set by the render
 // path, read by the render thread's warp setup).

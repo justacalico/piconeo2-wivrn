@@ -201,7 +201,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String CTRL_UNITY_VERSION = "2.8.6.9";
 
     // Held for the app's lifetime so the Wi-Fi link stays reliable for streaming:
-    //  - MulticastLock: ALVR discovers the PC server via mDNS/broadcast; without
+    //  - MulticastLock: WiVRn discovers the PC server via mDNS/broadcast; without
     //    this, Android filters multicast/broadcast packets and discovery can stall.
     //  - WifiLock(HIGH_PERF): keeps the Wi-Fi radio out of power-save so latency
     //    doesn't spike / the link doesn't drop when the screen state changes.
