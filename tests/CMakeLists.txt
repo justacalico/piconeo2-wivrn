@@ -40,12 +40,14 @@ add_library(p2wivrn_testable STATIC
     ${WIVRN_DIR}/common/wivrn_sockets.cpp
     ${CPP_DIR}/core/app_state.cpp
     ${CPP_DIR}/core/device_info.cpp
+    ${CPP_DIR}/core/eye_tracking.cpp
     ${CPP_DIR}/core/foveation.cpp
     ${CPP_DIR}/input/input.cpp
     ${CPP_DIR}/ui/ui_kit.cpp
     ${CPP_DIR}/ui/eq_panel.cpp
     ${CPP_DIR}/ui/server_list.cpp
     ${CPP_DIR}/render/menu_model.cpp
+    ${CPP_DIR}/streaming/pvr_eye_bridge.cpp
     ${CMAKE_BINARY_DIR}/version.cpp
 )
 
@@ -92,7 +94,7 @@ target_link_libraries(p2wivrn_testable PUBLIC
 
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test_*.cpp)
 
-add_executable(p2wivrn_tests ${TEST_SOURCES} main.cpp stubs.cpp)
+add_executable(p2wivrn_tests ${TEST_SOURCES} main.cpp stubs.cpp pvr_stubs.cpp)
 target_link_libraries(p2wivrn_tests PRIVATE p2wivrn_testable)
 target_compile_options(p2wivrn_tests PRIVATE -O0 -g --coverage)
 
