@@ -730,15 +730,14 @@ bool streaming_client::connect_to_server()
 				if (rp->ai_family == AF_INET)
 				{
 					auto * addr = (struct sockaddr_in *)rp->ai_addr;
-					in_addr ip = addr->sin_addr;
-					ALOGI("connect_to_server: trying IPv4 %s", inet_ntoa(ip));
-					spdlog::warn("connect: trying IPv4 {}", inet_ntoa(ip));
+					ALOGI("connect_to_server: trying IPv4 %s", inet_ntoa(addr->sin_addr));
+					spdlog::warn("connect: trying IPv4 {}", inet_ntoa(addr->sin_addr));
 
 					try
 					{
 						ALOGI("connect_to_server: creating wivrn_session_pico (IPv4)");
 						session = std::make_unique<wivrn_session_pico>(
-							ip, server_port, tcp_only, headset_keypair, model_name, pin_enter, shutdown);
+							*addr, tcp_only, headset_keypair, model_name, pin_enter, shutdown);
 						ALOGI("connect_to_server: session created, handshake_ok=%d", (int)(session && session->is_handshake_ok()));
 					}
 					catch (std::exception & e)
@@ -759,15 +758,14 @@ bool streaming_client::connect_to_server()
 				else if (rp->ai_family == AF_INET6)
 				{
 					auto * addr = (struct sockaddr_in6 *)rp->ai_addr;
-					in6_addr ip = addr->sin6_addr;
 					char ip6str[INET6_ADDRSTRLEN];
-				 inet_ntop(AF_INET6, &ip, ip6str, sizeof(ip6str));
+				 inet_ntop(AF_INET6, &addr->sin6_addr, ip6str, sizeof(ip6str));
 					ALOGI("connect_to_server: trying IPv6 %s", ip6str);
 					try
 					{
 						ALOGI("connect_to_server: creating wivrn_session_pico (IPv6)");
 						session = std::make_unique<wivrn_session_pico>(
-							ip, server_port, tcp_only, headset_keypair, model_name, pin_enter, shutdown);
+							*addr, tcp_only, headset_keypair, model_name, pin_enter, shutdown);
 						ALOGI("connect_to_server: session created (IPv6), handshake_ok=%d", (int)(session && session->is_handshake_ok()));
 					}
 					catch (std::exception & e)
@@ -848,7 +846,8 @@ void streaming_client::send_headset_info()
 	info.palm_pose = false;
 	info.user_presence = true;
 	info.passthrough = false;
-	info.face_tracking = gEyeSupported.load() ? (from_headset::face_type)2 : (from_headset::face_type)0;
+	info.face_tracking = gEyeSupported.load() ? from_headset::face_type::fb2 : from_headset::face_type::none;
+	info.body_tracking = from_headset::body_type::none;
 	info.num_generic_trackers = 0;
 
 	// Request 10-bit encoding for better quality (eliminates banding

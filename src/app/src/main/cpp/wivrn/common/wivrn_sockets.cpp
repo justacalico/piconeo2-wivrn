@@ -85,24 +85,14 @@ void wivrn::UDP::bind(sockaddr_in6 address)
 		throw std::system_error{errno, std::generic_category()};
 }
 
-void wivrn::UDP::connect(in6_addr address, int port)
+void wivrn::UDP::connect(sockaddr_in6 sa)
 {
-	sockaddr_in6 sa;
-	sa.sin6_family = AF_INET6;
-	sa.sin6_addr = address;
-	sa.sin6_port = htons(port);
-
 	if (::connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 		throw std::system_error{errno, std::generic_category()};
 }
 
-void wivrn::UDP::connect(in_addr address, int port)
+void wivrn::UDP::connect(sockaddr_in sa)
 {
-	sockaddr_in sa;
-	sa.sin_family = AF_INET;
-	sa.sin_addr = address;
-	sa.sin_port = htons(port);
-
 	if (::connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 		throw std::system_error{errno, std::generic_category()};
 }
@@ -173,17 +163,12 @@ wivrn::TCP::TCP(int fd)
 	init();
 }
 
-wivrn::TCP::TCP(in6_addr address, int port)
+wivrn::TCP::TCP(sockaddr_in6 sa)
 {
 	fd = socket(AF_INET6, SOCK_STREAM, 0);
 	if (fd < 0)
 		throw std::system_error{errno, std::generic_category()};
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
-
-	sockaddr_in6 sa;
-	sa.sin6_family = AF_INET6;
-	sa.sin6_addr = address;
-	sa.sin6_port = htons(port);
 
 	if (connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 	{
@@ -194,17 +179,12 @@ wivrn::TCP::TCP(in6_addr address, int port)
 	init();
 }
 
-wivrn::TCP::TCP(in_addr address, int port)
+wivrn::TCP::TCP(sockaddr_in sa)
 {
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0)
 		throw std::system_error{errno, std::generic_category()};
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
-
-	sockaddr_in sa;
-	sa.sin_family = AF_INET;
-	sa.sin_addr = address;
-	sa.sin_port = htons(port);
 
 	if (connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 	{
@@ -255,14 +235,12 @@ std::pair<wivrn::deserialization_packet, sockaddr_in6> wivrn::UDP::receive_from_
 	sockaddr_in6 addr;
 	socklen_t addrlen = sizeof(addr);
 
-	size_t size = recvfrom(fd, nullptr, 0, MSG_PEEK | MSG_TRUNC, (sockaddr *)&addr, &addrlen);
+	ssize_t peeked = recvfrom(fd, nullptr, 0, MSG_PEEK | MSG_TRUNC, (sockaddr *)&addr, &addrlen);
+	if (peeked < 0)
+		throw std::system_error{errno, std::generic_category()};
 
-#if defined(__cpp_lib_smart_ptr_for_overwrite) && __cpp_lib_smart_ptr_for_overwrite >= 202002L
-	auto buffer = std::make_shared_for_overwrite<uint8_t[]>(size);
-#else
-	std::shared_ptr<uint8_t[]> buffer(new uint8_t[size]);
-#endif
-	ssize_t received = recvfrom(fd, buffer.get(), size, 0, (sockaddr *)&addr, &addrlen);
+	auto buffer = std::make_shared_for_overwrite<uint8_t[]>(peeked);
+	ssize_t received = recvfrom(fd, buffer.get(), peeked, 0, (sockaddr *)&addr, &addrlen);
 	if (received < 0)
 		throw std::system_error{errno, std::generic_category()};
 
@@ -310,11 +288,7 @@ wivrn::deserialization_packet wivrn::UDP::receive_raw()
 	static const size_t num_messages = 20;
 	if ((not buffer) or buffer.use_count() > 1)
 	{
-#if defined(__cpp_lib_smart_ptr_for_overwrite) && __cpp_lib_smart_ptr_for_overwrite >= 202002L
 		buffer = std::make_shared_for_overwrite<uint8_t[]>(message_size * num_messages);
-#else
-		buffer.reset(new uint8_t[message_size * num_messages]);
-#endif
 	}
 	std::array<iovec, num_messages> iovecs;
 	std::array<mmsghdr, num_messages> mmsgs;
@@ -462,6 +436,8 @@ size_t wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 
 wivrn::deserialization_packet wivrn::TCP::receive_raw()
 {
+	static constexpr size_t max_payload = 16 * 1024 * 1024;
+
 	ssize_t expected_size;
 
 	if (data.size_bytes() < sizeof(uint32_t))
@@ -471,6 +447,8 @@ wivrn::deserialization_packet wivrn::TCP::receive_raw()
 	else
 	{
 		uint32_t payload_size = *reinterpret_cast<uint32_t *>(data.data());
+		if (payload_size > max_payload)
+			throw std::runtime_error("Invalid packet: size " + std::to_string(payload_size));
 		expected_size = payload_size + sizeof(uint32_t) - data.size_bytes();
 	}
 
@@ -479,11 +457,7 @@ wivrn::deserialization_packet wivrn::TCP::receive_raw()
 		size_t new_size = std::max<size_t>(data.size_bytes() + expected_size,
 		                                   4096);
 		auto old = std::move(buffer);
-#if defined(__cpp_lib_smart_ptr_for_overwrite) && __cpp_lib_smart_ptr_for_overwrite >= 202002L
 		buffer = std::make_shared_for_overwrite<uint8_t[]>(new_size);
-#else
-		buffer.reset(new uint8_t[new_size]);
-#endif
 		memcpy(buffer.get(), data.data(), data.size_bytes());
 		data = std::span(buffer.get(), data.size());
 		capacity_left = new_size - data.size_bytes();

@@ -54,6 +54,15 @@ void init_stream(T & stream)
 	stream.set_receive_buffer_size(1024 * 1024 * 5);
 	stream.set_send_buffer_size(1024 * 1024 * 5);
 }
+
+auto & port(sockaddr_in & sa)
+{
+	return sa.sin_port;
+}
+auto & port(sockaddr_in6 & sa)
+{
+	return sa.sin6_port;
+}
 } // namespace
 
 template <typename T>
@@ -131,7 +140,8 @@ void wivrn_session_pico::handshake(T address, bool tcp_only, crypto::key & heads
 			{
 				spdlog::warn("handshake: creating UDP stream socket");
 				stream = decltype(stream)();
-				stream.connect(address, h.stream_port);
+				port(address) = htons(h.stream_port);
+				stream.connect(address);
 				init_stream(stream);
 				spdlog::warn("handshake: UDP stream socket connected");
 			}
@@ -196,7 +206,8 @@ void wivrn_session_pico::handshake(T address, bool tcp_only, crypto::key & heads
 				stream = decltype(stream)();
 
 				stream.set_aes_key_and_ivs(s.stream_key, s.stream_iv_header_to_headset, s.stream_iv_header_from_headset);
-				stream.connect(address, h.stream_port);
+				port(address) = htons(h.stream_port);
+				stream.connect(address);
 				init_stream(stream);
 			}
 			break;
@@ -239,22 +250,22 @@ void wivrn_session_pico::handshake(T address, bool tcp_only, crypto::key & heads
 	}
 }
 
-wivrn_session_pico::wivrn_session_pico(in6_addr address, int port, bool tcp_only,
+wivrn_session_pico::wivrn_session_pico(sockaddr_in6 address, bool tcp_only,
                                        crypto::key & headset_keypair,
                                        const std::string & model_name,
                                        std::function<std::string(int fd)> pin_enter,
                                        std::atomic<bool> & shutdown_flag) :
-        control(address, port), stream(-1), address(address)
+        control(address), stream(-1), address(address.sin6_addr)
 {
 	handshake(address, tcp_only, headset_keypair, model_name, pin_enter, shutdown_flag);
 }
 
-wivrn_session_pico::wivrn_session_pico(in_addr address, int port, bool tcp_only,
+wivrn_session_pico::wivrn_session_pico(sockaddr_in address, bool tcp_only,
                                        crypto::key & headset_keypair,
                                        const std::string & model_name,
                                        std::function<std::string(int fd)> pin_enter,
                                        std::atomic<bool> & shutdown_flag) :
-        control(address, port), stream(-1), address(address)
+        control(address), stream(-1), address(address.sin_addr)
 {
 	handshake(address, tcp_only, headset_keypair, model_name, pin_enter, shutdown_flag);
 }
