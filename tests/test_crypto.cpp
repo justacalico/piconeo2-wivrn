@@ -226,3 +226,17 @@ TEST(crypto, cbc_encrypt_decrypt_roundtrip) {
 	pt.resize(plain.size());
 	CHECK(pt == plain);
 }
+
+TEST(crypto, block_cipher_rejects_multi_span_in_place) {
+	crypto::encrypt_context enc(EVP_aes_128_cbc());
+	std::array<uint8_t, 16> key{}, iv{};
+	enc.set_key_and_iv(key, iv);
+
+	uint8_t a[16] = {}, b[16] = {};
+	std::span<uint8_t> spans[2] = {std::span(a), std::span(b)};
+	CHECK_THROWS_AS(enc.encrypt_in_place(std::span(spans)), std::runtime_error);
+
+	crypto::decrypt_context dec(EVP_aes_128_cbc());
+	dec.set_key_and_iv(key, iv);
+	CHECK_THROWS_AS(dec.decrypt_in_place(std::span(spans)), std::runtime_error);
+}

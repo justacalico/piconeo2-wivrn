@@ -94,8 +94,30 @@ target_link_libraries(p2wivrn_testable PUBLIC
 
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test_*.cpp)
 
-add_executable(p2wivrn_tests ${TEST_SOURCES} main.cpp stubs.cpp pvr_stubs.cpp)
+add_executable(p2wivrn_tests ${TEST_SOURCES} main.cpp stubs.cpp pvr_stubs.cpp openssl_wrap.cpp)
 target_link_libraries(p2wivrn_tests PRIVATE p2wivrn_testable)
+
+# Route the OpenSSL calls under test through the fault-injection wrappers.
+foreach(sym
+        BIO_new BIO_new_mem_buf
+        PEM_read_bio_PUBKEY PEM_read_bio_PrivateKey
+        PEM_write_bio_PUBKEY PEM_write_bio_PrivateKey
+        EVP_PKEY_CTX_new EVP_PKEY_CTX_new_id
+        EVP_PKEY_keygen_init EVP_PKEY_keygen
+        EVP_PKEY_CTX_set_rsa_keygen_bits EVP_PKEY_CTX_set_kem_op
+        EVP_PKEY_derive_init EVP_PKEY_derive_set_peer EVP_PKEY_derive
+        EVP_PKEY_encapsulate_init EVP_PKEY_encapsulate
+        EVP_PKEY_decapsulate_init EVP_PKEY_decapsulate
+        EVP_CIPHER_CTX_new EVP_CipherInit_ex2
+        EVP_EncryptInit_ex2 EVP_EncryptUpdate EVP_EncryptFinal_ex
+        EVP_DecryptInit EVP_DecryptInit_ex2 EVP_DecryptUpdate EVP_DecryptFinal_ex
+        EVP_KDF_fetch EVP_KDF_CTX_new EVP_KDF_derive
+        BN_new BN_CTX_new BN_dup BN_mpi2bn BN_bn2mpi BN_bn2bin BN_bn2hex
+        BN_bin2bn BN_hex2bn BN_sub BN_mod_exp BN_mod_mul BN_mod_sub
+        BN_mod_inverse BN_rand BN_set_word
+               EVP_MD_CTX_new EVP_DigestInit EVP_DigestUpdate EVP_DigestFinal)
+    target_link_options(p2wivrn_tests PRIVATE "-Wl,--wrap=${sym}")
+endforeach()
 target_compile_options(p2wivrn_tests PRIVATE -O0 -g --coverage)
 
 enable_testing()
