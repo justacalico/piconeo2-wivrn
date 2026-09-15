@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <cstring>
+#include <fcntl.h>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -474,4 +475,275 @@ TEST(sockets, typed_socket_udp) {
 	auto m = rx.receive();
 	CHECK(m.has_value());
 	CHECK_EQ(std::get<uint32_t>(*m), 33u);
+}
+
+TEST(sockets, udp_bind_conflict_throws) {
+	wivrn::UDP a;
+	sockaddr_in6 addr{};
+	addr.sin6_family = AF_INET6;
+	addr.sin6_addr = in6addr_any;
+	a.bind(addr);
+	uint16_t port = bound_port(a);
+
+	wivrn::UDP b;
+	addr.sin6_port = htons(port);
+	CHECK_THROWS_AS(b.bind(addr), std::system_error);
+}
+
+TEST(sockets, udp_ops_on_unix_fd_throw) {
+	int fds[2];
+	CHECK_EQ(socketpair(AF_UNIX, SOCK_DGRAM, 0, fds), 0);
+	close(fds[1]);
+
+	in6_addr mcast{};
+	inet_pton(AF_INET6, "ff02::1", &mcast);
+	{
+		wivrn::UDP s(fds[0]);
+		CHECK_THROWS_AS(s.subscribe_multicast(mcast), std::system_error);
+	}   // setsockopt failure also closed the fd inside subscribe_multicast
+
+	CHECK_EQ(socketpair(AF_UNIX, SOCK_DGRAM, 0, fds), 0);
+	close(fds[1]);
+	{
+		wivrn::UDP s(fds[0]);
+		CHECK_THROWS_AS(s.unsubscribe_multicast(mcast), std::system_error);
+	}
+
+	CHECK_EQ(socketpair(AF_UNIX, SOCK_DGRAM, 0, fds), 0);
+	close(fds[1]);
+	{
+		wivrn::UDP s(fds[0]);
+		CHECK_THROWS_AS(s.set_tos(0x10), std::system_error);
+	}
+}
+
+TEST(sockets, tcp_init_on_unix_socket_throws) {
+	int fds[2];
+	CHECK_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	close(fds[1]);
+	CHECK_THROWS_AS(wivrn::TCP(fds[0]), std::system_error);
+}
+
+TEST(sockets, udp_send_on_bad_fd_throws) {
+	wivrn::UDP bad(-1);
+	serialization_packet p;
+	p.serialize(uint32_t(1));
+	CHECK_THROWS_AS(bad.send_raw(std::move(p)), std::system_error);
+
+	std::vector<serialization_packet> pkts(1);
+	pkts[0].serialize(uint32_t(2));
+	CHECK_THROWS_AS(bad.send_many_raw(pkts), std::system_error);
+}
+
+TEST(sockets, udp_encrypted_send_many_and_receive_from) {
+	wivrn::UDP rx;
+	sockaddr_in6 a{};
+	a.sin6_family = AF_INET6;
+	a.sin6_addr = in6addr_any;
+	rx.bind(a);
+	uint16_t port = bound_port(rx);
+
+	wivrn::UDP tx;
+	tx.connect(loopback6(port));
+
+	std::array<uint8_t, 16> key{};
+	std::array<uint8_t, 8> iv_ab{}, iv_ba{};
+	for (int i = 0; i < 16; ++i)
+		key[i] = uint8_t(i + 1);
+	for (int i = 0; i < 8; ++i) {
+		iv_ab[i] = uint8_t(0x20 + i);
+		iv_ba[i] = uint8_t(0x60 + i);
+	}
+	tx.set_aes_key_and_ivs(key, /*recv*/ iv_ba, /*send*/ iv_ab);
+	rx.set_aes_key_and_ivs(key, /*recv*/ iv_ab, /*send*/ iv_ba);
+
+	std::vector<serialization_packet> pkts(3);
+	for (uint32_t i = 0; i < 3; ++i)
+		pkts[i].serialize(i + 7);
+	tx.send_many_raw(pkts);
+
+	for (uint32_t i = 0; i < 3; ++i) {
+		auto [pkt, from] = rx.receive_from_raw();
+		CHECK_EQ(pkt.deserialize<uint32_t>(), i + 7);
+	}
+}
+
+TEST(sockets, tcp_send_after_write_shutdown_throws) {
+	wivrn::TCPListener listener(0);
+	uint16_t port = bound_port(listener);
+	wivrn::TCP client(loopback6(port));
+	auto [server, peer] = listener.accept<wivrn::TCP>();
+
+	shutdown(client.get_fd(), SHUT_WR);
+	serialization_packet p;
+	p.serialize(uint32_t(1));
+	CHECK_THROWS_AS(client.send_raw(std::move(p)), std::system_error);
+
+	std::vector<serialization_packet> pkts(1);
+	pkts[0].serialize(uint32_t(2));
+	CHECK_THROWS_AS(client.send_many_raw(pkts), std::system_error);
+}
+
+TEST(sockets, tcp_partial_send_when_buffer_full) {
+	wivrn::TCPListener listener(0);
+	uint16_t port = bound_port(listener);
+	wivrn::TCP client(loopback6(port));
+	auto [server, peer] = listener.accept<wivrn::TCP>();
+
+	// Shrink the send buffer and make the fd nonblocking so sendmsg returns
+	// short counts (iovec cursor adjust path) and finally EAGAIN.
+	int sndbuf = 4096;
+	setsockopt(client.get_fd(), SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+	fcntl(client.get_fd(), F_SETFL, O_NONBLOCK);
+
+	std::vector<uint8_t> blob(2 * 1024 * 1024, 0xab);
+	serialization_packet p;
+	p.serialize(blob);
+	bool threw = false;
+	for (int i = 0; i < 200 && !threw; ++i) {
+		try {
+			client.send_raw(std::move(p));
+		} catch (const std::system_error &) {
+			threw = true;
+		}
+	}
+	CHECK(threw);
+}
+
+TEST(sockets, tcp_partial_send_many_encrypted) {
+	wivrn::TCPListener listener(0);
+	uint16_t port = bound_port(listener);
+	wivrn::TCP client(loopback6(port));
+	auto [server, peer] = listener.accept<wivrn::TCP>();
+
+	std::array<uint8_t, 16> key{}, iv{};
+	for (int i = 0; i < 16; ++i) {
+		key[i] = uint8_t(i);
+		iv[i] = uint8_t(0x30 + i);
+	}
+	client.set_aes_key_and_ivs(key, iv, iv);
+
+	int sndbuf = 4096;
+	setsockopt(client.get_fd(), SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+	fcntl(client.get_fd(), F_SETFL, O_NONBLOCK);
+
+	std::vector<serialization_packet> pkts(4);
+	std::vector<uint8_t> blob(64 * 1024, 0xcd);
+	for (auto & p: pkts)
+		p.serialize(blob);
+	bool threw = false;
+	for (int i = 0; i < 400 && !threw; ++i) {
+		try {
+			client.send_many_raw(pkts);
+		} catch (const std::system_error &) {
+			threw = true;
+		}
+	}
+	CHECK(threw);
+}
+
+TEST(sockets, tcp_tiny_fragment_then_incomplete) {
+	wivrn::TCPListener listener(0);
+	uint16_t port = bound_port(listener);
+	wivrn::TCP client(loopback6(port));
+	auto [server, peer] = listener.accept<wivrn::TCP>();
+
+	// Fewer than 4 bytes buffered: not even a header yet.
+	uint8_t two[2] = {0, 0};
+	send(client.get_fd(), two, 2, MSG_NOSIGNAL);
+	for (int i = 0; i < 1000; ++i) {
+		try {
+			if (server.receive_raw().empty())
+				break;
+		} catch (const std::system_error &) {
+		}
+		usleep(1000);
+	}
+	CHECK(server.receive_pending().empty());
+
+	// Header promising 100 bytes but only 10 sent: stays incomplete.
+	uint32_t size = 100;
+	send(client.get_fd(), &size, 4, MSG_NOSIGNAL);
+	uint8_t ten[10] = {};
+	send(client.get_fd(), ten, 10, MSG_NOSIGNAL);
+	for (int i = 0; i < 1000; ++i) {
+		try {
+			server.receive_raw();
+			break;
+		} catch (const std::system_error &) {
+		}
+		usleep(1000);
+	}
+	CHECK(server.receive_pending().empty());
+}
+
+TEST(sockets, typed_socket_receive_size_and_empty) {
+	using Msg = std::variant<uint32_t, std::string>;
+	using Sock = wivrn::typed_socket<wivrn::TCP, Msg, Msg>;
+
+	wivrn::TCPListener listener(0);
+	Sock client(loopback6(bound_port(listener)));
+	auto [server_base, peer] = listener.accept<Sock>();
+	Sock & server = server_base;
+
+	// A lone partial header is buffered but yields no packet.
+	wivrn::serialization_packet sp;
+	Sock::serialize(sp, uint32_t(0xaabbccdd));
+	std::vector<uint8_t> payload;
+	for (auto span: (std::vector<std::span<uint8_t>>)sp)
+		payload.insert(payload.end(), span.begin(), span.end());
+
+	uint32_t size = payload.size();
+	send(client.get_fd(), &size, 2, MSG_NOSIGNAL);
+	bool got_empty = false;
+	for (int i = 0; i < 1000 && !got_empty; ++i) {
+		try {
+			got_empty = !server.receive().has_value();
+		} catch (const std::system_error &) {
+		}
+		usleep(1000);
+	}
+	CHECK(got_empty);
+
+	// Finish the header and payload, then receive with the byte counter.
+	send(client.get_fd(), (char *)&size + 2, 2, MSG_NOSIGNAL);
+	send(client.get_fd(), payload.data(), payload.size(), MSG_NOSIGNAL);
+
+	std::atomic<uint64_t> bytes{0};
+	std::optional<Msg> m;
+	for (int i = 0; i < 1000 && !m; ++i) {
+		m = server.receive_pending(&bytes);
+		if (!m) {
+			try {
+				m = server.receive(&bytes);
+			} catch (const std::system_error &) {
+			}
+		}
+		usleep(1000);
+	}
+	CHECK(m.has_value());
+	if (!m)
+		return;
+	CHECK_EQ(std::get<uint32_t>(*m), uint32_t(0xaabbccdd));
+	CHECK(bytes.load() > 0);
+
+	// A packet already sitting in the socket buffer drains through the typed
+	// pending path: receive() pulls the frame in, receive_pending() pops it.
+	std::array<wivrn::serialization_packet, 3> batch;
+	Sock::serialize(batch[0], uint32_t(0x55));
+	Sock::serialize(batch[1], uint32_t(0x66));
+	Sock::serialize(batch[2], uint32_t(0x77));
+	client.send(std::span<wivrn::serialization_packet>(batch));
+	std::optional<Msg> m3;
+	for (int i = 0; i < 1000 && !m3; ++i) {
+		m3 = server.receive_pending(&bytes);
+		if (m3)
+			break;
+		try {
+			(void)server.receive(nullptr);
+		} catch (const std::system_error &) {
+		}
+		usleep(1000);
+	}
+	CHECK(m3.has_value());
 }
