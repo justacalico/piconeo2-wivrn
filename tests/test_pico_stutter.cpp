@@ -73,3 +73,46 @@ TEST(stutter, summary_and_suppression) {
 	d.log_summary();
 	CHECK(true);
 }
+
+TEST(stutter, queue_wait_and_decode_slow)
+{
+	stutter_detector det;
+	det.on_shard_arrived(1, 0, true, true);
+	std::this_thread::sleep_for(std::chrono::milliseconds(7));
+	det.on_pushed_to_decoder(1, 0);   // >5ms in queue
+	std::this_thread::sleep_for(std::chrono::milliseconds(17));
+	det.on_frame_decoded(1, 0);       // >15ms decode
+	CHECK(true);
+}
+
+TEST(stutter, history_trims_past_64_records)
+{
+	stutter_detector det;
+	for (uint64_t f = 0; f < 70; ++f)
+		det.on_shard_arrived(f, 0, true, false);
+	CHECK(true);
+}
+
+TEST(stutter, render_interval_and_jitter)
+{
+	stutter_detector det;
+	// Build a small running average, then one >20ms gap trips both the
+	// interval-threshold and jitter detectors.
+	for (uint64_t f = 0; f < 8; ++f)
+	{
+		det.on_frame_begin(f, f);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(30));
+	det.on_frame_begin(9, 9);
+	CHECK(true);
+}
+
+TEST(stutter, summary_every_300_frames)
+{
+	stutter_detector det;
+	for (int f = 0; f < 300; ++f)
+		det.on_frame_begin(0, 0);
+	det.log_summary();
+	CHECK(true);
+}

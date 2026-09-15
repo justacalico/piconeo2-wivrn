@@ -423,3 +423,9 @@ TEST(menu, build_runs_without_crash) {
 	menuBuild(vbuf, c, MenuHover{-1, 0, false});
 	CHECK_EQ(vbuf.size(), n); // same geometry regardless of hover
 }
+
+TEST(menu, row_height_default_for_unknown_kind) {
+	MenuItem it{};
+	it.kind = (MenuKind)99;
+	CHECK(std::abs(menuRowHeight(it) - 0.130f) < 1e-6);
+}

@@ -269,3 +269,27 @@ TEST(srvlist, scroll_shifts_hit_test) {
 	SrvHover h = hitServerContent(-0.3f, 0.09f, 0.16f);
 	CHECK_EQ(h.item, 1);
 }
+
+TEST(srvlist, build_skips_rows_outside_viewport) {
+	Reset r;
+	// Enough servers that scrolling pushes some rows off-screen.
+	std::vector<ServerInfo> list;
+	for (int i = 0; i < 20; ++i)
+		list.push_back(srv(("srv" + std::to_string(i)).c_str(), "10.0.0.1", i));
+	setServerList(list);
+
+	std::vector<float> v;
+	buildServerContent(v, 0.0f, -1, -1);
+	size_t full = v.size();
+	CHECK(full > 0);
+
+	// Deep scroll: early rows end up above the viewport -> fewer verts.
+	v.clear();
+	buildServerContent(v, 0.6f, -1, -1);
+	CHECK(v.size() < full);
+
+	// Extreme scroll: every server row off-screen -> at most the hint text.
+	v.clear();
+	buildServerContent(v, 100.0f, -1, -1);
+	CHECK(v.size() < full);
+}
