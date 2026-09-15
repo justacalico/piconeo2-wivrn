@@ -84,6 +84,60 @@ TEST(menu, hit_skips_disabled) {
 	CHECK_EQ(h.item, -1);
 }
 
+TEST(menu, hit_button_and_fader) {
+	MenuCategory c;
+	float v = 0;
+	MenuItem b;
+	b.kind = MK_BUTTON;
+	c.items.push_back(b);
+	MenuItem f;
+	f.kind = MK_FADER;
+	f.get = [&] { return v; };
+	f.set = [&](float x) { v = x; };
+	c.items.push_back(f);
+
+	float yTop0 = menuRowTop(c, 0);
+	// Button rect centre: (0, yTop - 0.035).
+	MenuHover h = menuHit(c, 0.0f, yTop0 - 0.035f);
+	CHECK_EQ(h.item, 0);
+	CHECK_EQ(h.part, 0);
+	CHECK(h.grab);
+
+	float yTop1 = menuRowTop(c, 1);
+	// Fader rect centre: (0, yTop - 0.105).
+	h = menuHit(c, 0.0f, yTop1 - 0.105f);
+	CHECK_EQ(h.item, 1);
+	CHECK(h.grab);
+}
+
+TEST(menu, custom_item_inside_regular_category) {
+	// A MK_CUSTOM row in a non-custom category delegates hit/act per-item.
+	MenuCategory c;
+	float v = 0;
+	c.items.push_back(toggle_item(v));
+	MenuItem cu;
+	cu.kind = MK_CUSTOM;
+	cu.customH = 0.2f;
+	int hits = 0, acts = 0, builds = 0;
+	cu.cHit = [&](float, float, MenuHover & h) { ++hits; h.item = 1; h.grab = true; };
+	cu.cAct = [&](const MenuHover &, bool, bool, float, float) { ++acts; };
+	cu.cBuild = [&](std::vector<float> &, const MenuHover &) { ++builds; };
+	c.items.push_back(cu);
+
+	// Hit inside the custom row's band (below the toggle).
+	float yTop1 = menuRowTop(c, 1);
+	MenuHover h = menuHit(c, 0.0f, yTop1 - 0.05f);
+	CHECK_EQ(hits, 1);
+	CHECK_EQ(h.item, 1);
+	// cAct only runs for whole-custom categories; here apply is a no-op.
+	menuApply(9, c, h, true, true, 0, 0);
+	CHECK_EQ(acts, 0);
+
+	std::vector<float> buf;
+	menuBuild(buf, c, MenuHover{});
+	CHECK_EQ(builds, 1);
+}
+
 TEST(menu, hit_stepper_parts) {
 	MenuCategory c;
 	float v = 5;
@@ -342,6 +396,10 @@ TEST(menu, build_runs_without_crash) {
 	f.get = [&] { return v; };
 	f.valueText = [](char * buf, int n) { snprintf(buf, (size_t)n, "50%%"); };
 	c.items.push_back(f);
+	MenuItem f2; // fader without a valueText: plain-label branch
+	f2.kind = MK_FADER;
+	f2.get = [&] { return v; };
+	c.items.push_back(f2);
 	MenuItem s;
 	s.kind = MK_STEPPER;
 	s.get = [&] { return v; };

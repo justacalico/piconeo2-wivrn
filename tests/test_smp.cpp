@@ -80,6 +80,14 @@ TEST(smp, step3_rejects_forged_proof) {
 	CHECK_THROWS_AS(alice.step3(m2), smp_cheated);
 }
 
+TEST(smp, step3_rejects_forged_log_proof) {
+	smp alice, bob;
+	auto m1 = alice.step1("1234");
+	auto m2 = bob.step2(m1, "1234");
+	m2[1] = bignum(42); // corrupt c3: knowledge-of-log proof fails
+	CHECK_THROWS_AS(alice.step3(m2), smp_cheated);
+}
+
 TEST(smp, step3_rejects_out_of_range) {
 	smp alice, bob;
 	auto m1 = alice.step1("1234");
@@ -98,6 +106,30 @@ TEST(smp, step4_rejects_forged_proof) {
 	CHECK_THROWS_AS(bob.step4(m3), smp_cheated);
 }
 
+TEST(smp, step4_rejects_bad_group_elements) {
+	smp alice, bob;
+	auto m1 = alice.step1("1234");
+	auto m2 = bob.step2(m1, "1234");
+	auto m3 = alice.step3(m2);
+
+	auto bad = m3;
+	bad[0] = bignum(0); // pa not a group element
+	CHECK_THROWS_AS(bob.step4(bad), smp_cheated);
+
+	bad = m3;
+	bad[3] = bignum(1); // d6 not a valid exponent
+	CHECK_THROWS_AS(bob.step4(bad), smp_cheated);
+}
+
+TEST(smp, step4_rejects_forged_coords_proof) {
+	smp alice, bob;
+	auto m1 = alice.step1("1234");
+	auto m2 = bob.step2(m1, "1234");
+	auto m3 = alice.step3(m2);
+	m3[2] = bignum(42); // corrupt cp: equal-coords proof fails
+	CHECK_THROWS_AS(bob.step4(m3), smp_cheated);
+}
+
 TEST(smp, step5_rejects_forged_proof) {
 	smp alice, bob;
 	auto m1 = alice.step1("1234");
@@ -107,6 +139,23 @@ TEST(smp, step5_rejects_forged_proof) {
 	CHECK(ok);
 	m4[1] = bignum(9); // corrupt cr
 	CHECK_THROWS_AS(alice.step5(m4), smp_cheated);
+}
+
+TEST(smp, step5_rejects_bad_group_elements) {
+	smp alice, bob;
+	auto m1 = alice.step1("1234");
+	auto m2 = bob.step2(m1, "1234");
+	auto m3 = alice.step3(m2);
+	auto [m4, ok] = bob.step4(m3);
+	CHECK(ok);
+
+	auto bad = m4;
+	bad[0] = bignum(0); // rb not a group element
+	CHECK_THROWS_AS(alice.step5(bad), smp_cheated);
+
+	bad = m4;
+	bad[2] = bignum(1); // d7 not a valid exponent
+	CHECK_THROWS_AS(alice.step5(bad), smp_cheated);
 }
 
 TEST(smp, bignum_conversions) {
@@ -122,6 +171,12 @@ TEST(smp, bignum_conversions) {
 	CHECK(a == c);
 
 	CHECK_EQ(a.data_size(), data.size());
+}
+
+TEST(smp, bignum_from_mpi_garbage_throws) {
+	// A 4-byte length prefix claiming a huge number -> BN_mpi2bn fails.
+	CHECK_THROWS_AS(bignum::from_mpi(std::string("\xff\xff\xff\xff", 4)),
+	                std::runtime_error);
 }
 
 TEST(smp, bignum_comparison_and_copy) {

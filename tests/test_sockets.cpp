@@ -77,6 +77,46 @@ TEST(sockets, fd_base_move_and_close) {
 	CHECK(b);
 	CHECK(!a); // moved-from is empty
 	CHECK(b.get_fd() == raw);
+
+	// Move-assign swaps the fds, so b ends up owning c's old socket.
+	wivrn::UDP c;
+	int c_raw = c.get_fd();
+	c = std::move(b);
+	CHECK(c.get_fd() == raw);
+	CHECK(b.get_fd() == c_raw);
+}
+
+TEST(sockets, udp_wraps_raw_fd) {
+	int raw = socket(AF_INET6, SOCK_DGRAM, 0);
+	CHECK(raw >= 0);
+	wivrn::UDP s(raw); // takes ownership
+	CHECK(s.get_fd() == raw);
+	sockaddr_in6 a{};
+	a.sin6_family = AF_INET6;
+	a.sin6_addr = in6addr_any;
+	s.bind(a);
+	CHECK(bound_port(s) != 0);
+}
+
+TEST(sockets, tcp_connect_refused_throws) {
+	// Bind+close to get a port nobody listens on.
+	wivrn::UDP probe = bound_udp();
+	uint16_t port = bound_port(probe);
+	probe = wivrn::UDP();
+
+	CHECK_THROWS_AS(wivrn::TCP(loopback6(port)), std::system_error);
+
+	sockaddr_in a{};
+	a.sin_family = AF_INET;
+	a.sin_port = htons(port);
+	inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+	CHECK_THROWS_AS(wivrn::TCP(a), std::system_error);
+}
+
+TEST(sockets, tcp_listener_double_bind_throws) {
+	wivrn::TCPListener l1(0);
+	uint16_t port = bound_port(l1);
+	CHECK_THROWS_AS(wivrn::TCPListener(port), std::system_error);
 }
 
 TEST(sockets, udp_roundtrip) {

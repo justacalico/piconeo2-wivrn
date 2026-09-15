@@ -190,3 +190,39 @@ TEST(crypto, bad_pem_throws) {
 	CHECK_THROWS(crypto::key::from_public_key("not a pem"));
 	CHECK_THROWS(crypto::key::from_private_key("not a pem"));
 }
+
+TEST(crypto, mismatched_dh_throws) {
+	crypto::key a = crypto::key::generate_x25519_keypair();
+	crypto::key rsa = crypto::key::generate_rsa_keypair(1024);
+	// X25519 private + RSA public: derive must fail.
+	CHECK_THROWS(crypto::key::diffie_hellman(a, rsa));
+}
+
+TEST(crypto, kem_on_wrong_key_type_throws) {
+	crypto::key a = crypto::key::generate_x25519_keypair();
+	CHECK_THROWS(a.encapsulate());
+	CHECK_THROWS(a.decapsulate(std::span<uint8_t>()));
+}
+
+TEST(crypto, decapsulate_garbage_throws_or_rejects) {
+	crypto::key k = crypto::key::generate_rsa_keypair(1024);
+	std::vector<uint8_t> junk(4, 0xff); // way too short for an RSA-wrapped blob
+	CHECK_THROWS(k.decapsulate(junk));
+}
+
+TEST(crypto, cbc_encrypt_decrypt_roundtrip) {
+	crypto::encrypt_context enc{EVP_aes_128_cbc()};
+	CHECK_EQ(enc.block_size(), 16u);
+	std::vector<uint8_t> key(16, 0x31), iv(16, 0x77);
+	enc.set_key_and_iv(key, iv);
+
+	std::vector<uint8_t> plain(37, 0x5c); // not a block multiple: exercises padding
+	auto ct = enc.encrypt(plain);
+	CHECK(ct.size() >= plain.size());
+
+	crypto::decrypt_context dec{EVP_aes_128_cbc()};
+	dec.set_key_and_iv(key, iv);
+	auto pt = dec.decrypt(ct);
+	pt.resize(plain.size());
+	CHECK(pt == plain);
+}
