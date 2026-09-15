@@ -418,7 +418,7 @@ std::vector<uint8_t> encrypt_context::encrypt(std::span<uint8_t> plaintext)
 		throw_openssl_error();
 
 	int size_out2 = 0;
-	if (not EVP_EncryptFinal_ex(ctx, plaintext.data() + size_out, &size_out2))
+	if (not EVP_EncryptFinal_ex(ctx, ciphertext.data() + size_out, &size_out2))
 		throw_openssl_error();
 
 	ciphertext.resize(size_out + size_out2);
@@ -475,7 +475,7 @@ std::vector<uint8_t> decrypt_context::decrypt(std::span<uint8_t> ciphertext)
 		throw_openssl_error();
 
 	int size_out2 = 0;
-	if (not EVP_DecryptFinal_ex(ctx, ciphertext.data() + size_out, &size_out2))
+	if (not EVP_DecryptFinal_ex(ctx, plaintext.data() + size_out, &size_out2))
 		throw_openssl_error();
 
 	plaintext.resize(size_out + size_out2);
