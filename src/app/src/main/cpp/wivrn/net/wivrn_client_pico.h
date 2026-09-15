@@ -59,12 +59,12 @@ private:
 public:
 	std::variant<in_addr, in6_addr> address;
 
-	wivrn_session_pico(in6_addr address, int port, bool tcp_only,
+	wivrn_session_pico(sockaddr_in6 address, bool tcp_only,
 	                   crypto::key & headset_keypair,
 	                   const std::string & model_name,
 	                   std::function<std::string(int fd)> pin_enter,
 	                   std::atomic<bool> & shutdown_flag);
-	wivrn_session_pico(in_addr address, int port, bool tcp_only,
+	wivrn_session_pico(sockaddr_in address, bool tcp_only,
 	                   crypto::key & headset_keypair,
 	                   const std::string & model_name,
 	                   std::function<std::string(int fd)> pin_enter,

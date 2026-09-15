@@ -2481,14 +2481,18 @@ void *renderThread(void *) {
                 if (gPassthrough) gPassthrough->stop();
                 gSlept = true;
                 if (g_stream && g_stream->session)
-                    g_stream->session->send_control(from_headset::user_presence_changed{.present = false});
+                    g_stream->session->send_control(from_headset::user_presence_changed{
+                            .present = false,
+                            .change_time = g_stream->to_xr_time(g_stream->get_timestamp_ns())});
             } else if (!wantSleep && gSlept) {
                 LOGI("proximity: headset donned -> resuming stream");
                 alvr_resume();
                 if (gPassthrough) gPassthrough->start();
                 gSlept = false;
                 if (g_stream && g_stream->session)
-                    g_stream->session->send_control(from_headset::user_presence_changed{.present = true});
+                    g_stream->session->send_control(from_headset::user_presence_changed{
+                            .present = true,
+                            .change_time = g_stream->to_xr_time(g_stream->get_timestamp_ns())});
             }
         }
 

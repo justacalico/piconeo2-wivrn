@@ -24,7 +24,7 @@ Native WiVRn client for the Pico Neo 2 family. Stream PC VR games to your headse
 
 ## WiVRn Version
 
-This client is compatible with WiVRn server version **26.6.2**.
+This client is compatible with WiVRn server version **26.9**.
 
 ## Prerequisites
 
