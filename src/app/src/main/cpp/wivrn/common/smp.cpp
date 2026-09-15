@@ -115,7 +115,7 @@ std::string bignum::to_data() const
 {
 	std::string output;
 	output.resize(BN_num_bytes(**this));
-	if (BN_bn2bin(**this, reinterpret_cast<unsigned char *>(output.data())) == 0)
+	if (BN_bn2bin(**this, reinterpret_cast<unsigned char *>(output.data())) != (int)output.size())
 		throw_openssl_error();
 	return output;
 }
