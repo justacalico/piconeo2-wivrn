@@ -289,3 +289,44 @@ TEST(ser, type_hash_stability) {
 	CHECK(wivrn::serialization_type_hash<uint32_t>(0) != wivrn::serialization_type_hash<uint32_t>(1));
 	CHECK(wivrn::serialization_type_hash<int32_t>(0) != wivrn::serialization_type_hash<uint32_t>(0));
 }
+
+TEST(ser, deserialize_into_existing_and_wire_size) {
+	serialization_packet p;
+	p.serialize(uint32_t(0xdeadbeef));
+	std::vector<std::span<uint8_t>> & spans = p;
+	size_t total = 0;
+	for (auto s: spans)
+		total += s.size();
+
+	std::shared_ptr<uint8_t[]> mem(new uint8_t[total]);
+	size_t off = 0;
+	for (auto s: spans) {
+		memcpy(mem.get() + off, s.data(), s.size());
+		off += s.size();
+	}
+
+	deserialization_packet dp(mem, std::span(mem.get(), total));
+	CHECK_EQ(dp.wire_size(), total);
+	uint32_t out = 0;
+	dp.deserialize(out);   // void overload writing into an existing object
+	CHECK_EQ(out, 0xdeadbeefu);
+}
+
+TEST(ser, serialized_size_of_size_boundaries) {
+	CHECK_EQ(wivrn::serialized_size_of_size(0), sizeof(uint16_t));
+	CHECK_EQ(wivrn::serialized_size_of_size(0x7ffe), sizeof(uint16_t));
+	CHECK_EQ(wivrn::serialized_size_of_size(0x7fff), 2 * sizeof(uint16_t));
+	CHECK_EQ(wivrn::serialized_size_of_size(0x7fff'fffe), 2 * sizeof(uint16_t));
+	// Volatile arg stops constexpr folding so the middle branch really runs.
+	volatile size_t mid = 0x8000;
+	CHECK_EQ(wivrn::serialized_size_of_size(mid), 2 * sizeof(uint16_t));
+	CHECK_THROWS_AS(wivrn::serialized_size_of_size(0x7fff'ffff), serialization_error);
+	CHECK_THROWS_AS(wivrn::serialized_size_of_size(0x8000'0000), serialization_error);
+}
+
+TEST(ser, hash_feeds_negative_ints) {
+	// The hasher's signed-int path is only exercised by negative enum values.
+	wivrn::details::hash_context h;
+	uint64_t before = h.hash;
+	CHECK(h.feed(int64_t(-7)) != before);
+}
