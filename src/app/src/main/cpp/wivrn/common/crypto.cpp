@@ -44,6 +44,8 @@ struct bio
 	bio()
 	{
 		mem = BIO_new(BIO_s_mem());
+		if (!mem)
+			throw_openssl_error();
 	}
 
 	bio(std::string_view data)
@@ -224,14 +226,16 @@ key key::from_private_key(std::string_view pem)
 std::string key::public_key() const
 {
 	bio mem;
-	PEM_write_bio_PUBKEY(mem, pkey);
+	if (PEM_write_bio_PUBKEY(mem, pkey) == 0)
+		throw_openssl_error();
 	return mem;
 }
 
 std::string key::private_key() const
 {
 	bio mem;
-	PEM_write_bio_PrivateKey(mem, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+	if (PEM_write_bio_PrivateKey(mem, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 0)
+		throw_openssl_error();
 	return mem;
 }
 
