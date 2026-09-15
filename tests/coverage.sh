@@ -22,15 +22,16 @@ find "$WORK" -name '*.gcov' -print0 | sort -z | xargs -0 cat | awk -v cpp="$CPP"
         cur = (index(file, cpp) == 1) ? substr(file, length(cpp) + 2) : "";
         next;
     }
-    /^ *[0-9$*#=-]+:/ {
-        # gcov format: count:lineno:source. - = dead line, ##### = not run.
+    /^ *[0-9$*#=%-]+:/ {
+        # gcov format: count:lineno:source. - = dead line; #####, =====, $$$$$
+        # and %%%%% are all forms of not-run.
         split($0, a, ":");
         count = a[1]; lineno = a[2] + 0; gsub(/^[ \t]+|[ \t]+$/, "", count);
         rest = substr($0, index($0, ":") + 1);
         src = substr(rest, index(rest, ":") + 1);
         if (cur != "" && lineno > 0 && count != "-") {
             total[cur SUBSEP lineno] = 1;
-            if (count != "#####" && count != "=====")
+            if (count !~ /^[#$%=]+$/)
                 hit[cur SUBSEP lineno] = 1;
             srcline[cur SUBSEP lineno] = src;
         }
