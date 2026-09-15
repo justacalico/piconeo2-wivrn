@@ -94,7 +94,7 @@ target_link_libraries(p2wivrn_testable PUBLIC
 
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test_*.cpp)
 
-add_executable(p2wivrn_tests ${TEST_SOURCES} main.cpp stubs.cpp pvr_stubs.cpp openssl_wrap.cpp)
+add_executable(p2wivrn_tests ${TEST_SOURCES} main.cpp stubs.cpp pvr_stubs.cpp openssl_wrap.cpp libc_wrap.cpp)
 target_link_libraries(p2wivrn_tests PRIVATE p2wivrn_testable)
 
 # Route the OpenSSL calls under test through the fault-injection wrappers.
@@ -115,7 +115,12 @@ foreach(sym
         BN_new BN_CTX_new BN_dup BN_mpi2bn BN_bn2mpi BN_bn2bin BN_bn2hex
         BN_bin2bn BN_hex2bn BN_sub BN_mod_exp BN_mod_mul BN_mod_sub
         BN_mod_inverse BN_rand BN_set_word
-               EVP_MD_CTX_new EVP_DigestInit EVP_DigestUpdate EVP_DigestFinal)
+        EVP_MD_CTX_new EVP_DigestInit EVP_DigestUpdate EVP_DigestFinal
+        socket bind connect listen accept setsockopt
+        recvfrom recv recvmmsg sendmsg sendmmsg writev
+        opendir fopen
+        sched_setscheduler sched_setaffinity sched_getaffinity
+        setpriority sysconf)
     target_link_options(p2wivrn_tests PRIVATE "-Wl,--wrap=${sym}")
 endforeach()
 target_compile_options(p2wivrn_tests PRIVATE -O0 -g --coverage)
