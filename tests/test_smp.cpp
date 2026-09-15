@@ -171,6 +171,12 @@ TEST(smp, bignum_conversions) {
 	CHECK(a == c);
 
 	CHECK_EQ(a.data_size(), data.size());
+
+	// A zero bignum serializes to empty data; BN_bn2bin returning 0 bytes is
+	// not an error there.
+	bignum zero(0);
+	CHECK(zero.to_data().empty());
+	CHECK_EQ(bignum::from_data(zero.to_data()), zero);
 }
 
 TEST(smp, bignum_from_mpi_garbage_throws) {
