@@ -53,17 +53,24 @@ void deleter::operator()(EVP_MD_CTX * ctx)
 
 bignum::bignum(const bignum & other) :
         number(other.number ? BN_dup(*other) : nullptr)
-{}
+{
+	if (other.number && !number)
+		throw std::bad_alloc();
+}
 
 bignum & bignum::operator=(const bignum & other)
 {
 	number.reset(other.number ? BN_dup(*other) : nullptr);
+	if (other.number && !number)
+		throw std::bad_alloc();
 	return *this;
 }
 
 bignum::bignum(int64_t value)
 {
 	BIGNUM * bn = BN_new();
+	if (not bn)
+		throw_openssl_error();
 	if (BN_set_word(bn, value) == 0)
 		throw_openssl_error();
 	number.reset(bn);
@@ -95,8 +102,12 @@ bignum bignum::from_data(const std::string & value)
 std::string bignum::to_mpi() const
 {
 	std::string output;
-	output.resize(BN_bn2mpi(**this, nullptr));
-	BN_bn2mpi(**this, reinterpret_cast<unsigned char *>(output.data()));
+	int size = BN_bn2mpi(**this, nullptr);
+	if (size <= 0)
+		throw_openssl_error();
+	output.resize(size);
+	if (BN_bn2mpi(**this, reinterpret_cast<unsigned char *>(output.data())) == 0)
+		throw_openssl_error();
 	return output;
 }
 
@@ -104,13 +115,16 @@ std::string bignum::to_data() const
 {
 	std::string output;
 	output.resize(BN_num_bytes(**this));
-	BN_bn2bin(**this, reinterpret_cast<unsigned char *>(output.data()));
+	if (BN_bn2bin(**this, reinterpret_cast<unsigned char *>(output.data())) != (int)output.size())
+		throw_openssl_error();
 	return output;
 }
 
 std::string bignum::to_hex() const
 {
 	char * hex = BN_bn2hex(**this);
+	if (not hex)
+		throw_openssl_error();
 	std::string output = hex;
 	OPENSSL_free(hex);
 	return output;
@@ -130,7 +144,13 @@ bignum bignum::from_mpi(const std::string & value)
 
 static BN_CTX * bn_ctx()
 {
-	thread_local BN_CTX * ctx = BN_CTX_new();
+	thread_local BN_CTX * ctx = nullptr;
+	if (not ctx)
+	{
+		ctx = BN_CTX_new();
+		if (not ctx)
+			throw_openssl_error();
+	}
 	return ctx;
 }
 
@@ -197,7 +217,8 @@ static bignum random_exponent()
 {
 	/* Generate a random exponent */
 	bignum randexpon;
-	BN_rand(*randexpon, smp::SM_MOD_LEN_BITS, -1, 0);
+	if (BN_rand(*randexpon, smp::SM_MOD_LEN_BITS, -1, 0) == 0)
+		throw_openssl_error();
 
 	return randexpon;
 }
@@ -210,6 +231,8 @@ bignum smp::hash(int version, const bignum & a, const bignum * b)
 	                    (b ? b->to_mpi() : "");
 
 	std::unique_ptr<EVP_MD_CTX, deleter> ctx{EVP_MD_CTX_create()};
+	if (not ctx)
+		throw_openssl_error();
 
 	if (EVP_DigestInit(ctx.get(), EVP_sha256()) == 0)
 		throw_openssl_error();

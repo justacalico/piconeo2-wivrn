@@ -230,7 +230,7 @@ void loadAllConfig() {
                 else if (keyIs(key, keyLen, "brightness"))           { if (sscanf(v, "%f", &fv) == 1 && fv >= 0.0f) { gBrightnessFrac.store(clampf(fv, 0.0f, 1.0f)); gBrightnessSaved.store(true); } }
                 else if (keyIs(key, keyLen, "eqPreset"))             { if (sscanf(v, "%d", &iv) == 1) { if (iv < 0 || iv >= kEqNumPresets) iv = 0; gEqPresetIdx = iv; } }
                 else if (keyIs(key, keyLen, "eqCustom1") || keyIs(key, keyLen, "eqCustom2")) {
-                    int slot = (key[7] == '2') ? 1 : 0;
+                    int slot = (key[keyLen - 1] == '2') ? 1 : 0;
                     const char *p = v;
                     for (int i = 0; i < kEqBands; i++) {
                         float g; int adv = 0;

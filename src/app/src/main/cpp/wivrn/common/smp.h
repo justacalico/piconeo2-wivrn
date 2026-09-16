@@ -29,6 +29,7 @@
 #include <array>
 #include <cassert>
 #include <memory>
+#include <new>
 #include <openssl/bn.h>
 #include <string>
 
@@ -68,7 +69,11 @@ public:
 	BIGNUM * operator*()
 	{
 		if (!number)
+		{
 			number.reset(BN_new());
+			if (!number)
+				throw std::bad_alloc();
+		}
 
 		return number.get();
 	}

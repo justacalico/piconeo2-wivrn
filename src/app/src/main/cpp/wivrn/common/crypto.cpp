@@ -44,6 +44,8 @@ struct bio
 	bio()
 	{
 		mem = BIO_new(BIO_s_mem());
+		if (!mem)
+			throw_openssl_error();
 	}
 
 	bio(std::string_view data)
@@ -224,14 +226,16 @@ key key::from_private_key(std::string_view pem)
 std::string key::public_key() const
 {
 	bio mem;
-	PEM_write_bio_PUBKEY(mem, pkey);
+	if (PEM_write_bio_PUBKEY(mem, pkey) == 0)
+		throw_openssl_error();
 	return mem;
 }
 
 std::string key::private_key() const
 {
 	bio mem;
-	PEM_write_bio_PrivateKey(mem, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+	if (PEM_write_bio_PrivateKey(mem, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 0)
+		throw_openssl_error();
 	return mem;
 }
 
@@ -418,7 +422,7 @@ std::vector<uint8_t> encrypt_context::encrypt(std::span<uint8_t> plaintext)
 		throw_openssl_error();
 
 	int size_out2 = 0;
-	if (not EVP_EncryptFinal_ex(ctx, plaintext.data() + size_out, &size_out2))
+	if (not EVP_EncryptFinal_ex(ctx, ciphertext.data() + size_out, &size_out2))
 		throw_openssl_error();
 
 	ciphertext.resize(size_out + size_out2);
@@ -475,7 +479,7 @@ std::vector<uint8_t> decrypt_context::decrypt(std::span<uint8_t> ciphertext)
 		throw_openssl_error();
 
 	int size_out2 = 0;
-	if (not EVP_DecryptFinal_ex(ctx, ciphertext.data() + size_out, &size_out2))
+	if (not EVP_DecryptFinal_ex(ctx, plaintext.data() + size_out, &size_out2))
 		throw_openssl_error();
 
 	plaintext.resize(size_out + size_out2);
