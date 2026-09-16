@@ -115,7 +115,6 @@ add_library(p2wivrn SHARED
     core/app_state.cpp
     core/device_info.cpp
     core/eye_tracking.cpp
-    core/foveation.cpp
     render/render_thread.cpp
     render/gl_util.cpp
     render/passthrough.cpp
@@ -130,7 +129,6 @@ add_library(p2wivrn SHARED
     streaming/streaming_client.cpp
     streaming/pvr_renderer.cpp
     streaming/pvr_eye_bridge.cpp
-    streaming/alvr_stubs.cpp
     streaming/wivrn_stream_adapter.cpp
     ${WIVRN_DIR}/net/wivrn_client_pico.cpp
     ${WIVRN_DIR}/video/pico_decoder.cpp

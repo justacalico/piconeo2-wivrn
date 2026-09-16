@@ -384,8 +384,10 @@ Java_org_meumeu_wivrn_neo2_pvr_MainActivity_nativeDrainHaptic(
             auto &r = g_stream->rumble[hand];
             if (r.active) {
                 p.pending = true;
-                p.amplitude = r.amplitude;
-                p.durationMs = r.duration_ms;
+                p.amplitude = r.amplitude > 1.0f ? 1.0f : r.amplitude;
+                // Clamp to a sane on-device window: floor very short pulses so
+                // the motor fires, cap long ones so a stuck event can't buzz forever.
+                p.durationMs = r.duration_ms < 12 ? 12 : (r.duration_ms > 1000 ? 1000 : r.duration_ms);
                 r.active = false;
                 r.amplitude = 0.0f;
                 r.duration_ms = 0;
@@ -464,8 +466,8 @@ Java_org_meumeu_wivrn_neo2_pvr_MainActivity_nativeSetServerList(
     setServerList(servers);
 }
 
-// Set the ALVR stream FOV (per-eye degrees). Render thread picks up gFovDirty
-// and reapplies the warp mesh + view params.
+// Set the stream FOV (per-eye degrees). Render thread picks up gFovDirty
+// and reapplies the warp mesh.
 extern "C" JNIEXPORT void JNICALL
 Java_org_meumeu_wivrn_neo2_pvr_MainActivity_nativeSetFov(
         JNIEnv *env, jobject thiz, jfloat fovDeg) {

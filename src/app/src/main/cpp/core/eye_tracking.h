@@ -15,8 +15,6 @@ extern std::atomic<bool>  gGazeValid;
 // Per-eye openness (0=closed..1=open), captured even mid-blink. Tracking-thread-only.
 extern float gEyeOpen[2];
 extern bool  gEyeHaveOpen;
-// Smoothed openness (raw Tobii openness is ~quantized 0/1).
-extern float gEyeOpenSmooth[2];
 
 // Read Neo 2 EYE tracking and build OpenXR eye-gaze poses. out[0]=left, out[1]=right.
 // headQ = current head orientation (for global-space gaze compose).
@@ -30,7 +28,7 @@ extern bool gServerEyeEnabled;   // server eye source on (eye-worker-only)
 // Boot: detect EYE support but leave IR off (POSITION-only).
 void initEyeTrackingMode();
 // (Re)evaluate tracking mode: enable EYE bit only if supported AND streaming AND
-// server wants gaze. Call on STREAMING_STARTED / STREAMING_STOPPED.
+// server wants gaze. Call on stream start / stop.
 void applyServerEyeTracking(bool streaming);
 
 // ---- pico_oxr / pico_native compatibility shims ----

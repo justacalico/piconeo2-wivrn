@@ -44,8 +44,8 @@ extern "C" {
     int   Pvr_GetTrackingMode();
     void  Pvr_DisableBoundary();
     void  Pvr_ShutdownSDKBoundary();
-    // Tracking origin: 0=EyeLevel, 1=FloorLevel, 2=StageLevel. SteamVR/ALVR
-    // expect FLOOR origin; without it the head sits at y=0 and you spawn in the floor.
+    // Tracking origin: 0=EyeLevel, 1=FloorLevel, 2=StageLevel. SteamVR
+    // expects FLOOR origin; without it the head sits at y=0 and you spawn in the floor.
     bool  Pvr_SetTrackingOriginType(int trackingOriginType);
     // Recentering: Pvr_ResetSensorAll = full position+orientation reset.
     // svrRecenterOrientation resets full orientation (pitch+yaw+roll) for 3DoF.

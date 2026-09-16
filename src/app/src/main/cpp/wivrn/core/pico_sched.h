@@ -10,8 +10,8 @@
 #include <cstdio>
 #include <cstring>
 
-// CPU pinning + priority for the latency-critical threads, following what ALVR
-// does on the Neo 2: SD845 has cpu0-3 little / cpu4-7 big. Background tasks
+// CPU pinning + priority for the latency-critical threads on the Neo 2:
+// SD845 has cpu0-3 little / cpu4-7 big. Background tasks
 // parking our decode/render threads on little cores stretch decode->present
 // latency and add frame-arrival jitter. SCHED_FIFO usually EPERMs for a normal
 // app so we fall back to a favourable nice value. The top big core is reserved

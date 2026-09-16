@@ -1,6 +1,6 @@
 #pragma once
-// Stream swapchain state: the ALVR-to-WiVRn shim blits decoded frames into the
-// same ring the render thread submits to the SDK warp.
+// Stream swapchain state: the WiVRn stream adapter blits decoded frames into
+// the same ring the render thread submits to the SDK warp.
 #include <GLES3/gl3.h>
 #include <stdint.h>
 

@@ -34,7 +34,3 @@ struct PendingHaptic {
 };
 extern std::mutex     gHapticMutex;
 extern PendingHaptic  gHaptic[2];
-
-// Called from the render thread's ALVR event loop. Clamps duration, drops empty
-// pulses, and coalesces.
-void queueHaptic(int hand, float amplitude, float frequency, float durationS);

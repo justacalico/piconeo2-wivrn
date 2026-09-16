@@ -16,7 +16,6 @@ std::atomic<float> gGazeLocal[3] = { {0.0f}, {0.0f}, {-1.0f} };
 std::atomic<bool>  gGazeValid{false};
 float gEyeOpen[2] = {1,1};
 bool  gEyeHaveOpen = false;
-float gEyeOpenSmooth[2] = {1,1};
 
 std::atomic<bool> gEyeSupported{false};
 bool gServerEyeEnabled = false;
@@ -148,8 +147,8 @@ bool readEyeGazes(XrPosef out[2], bool *vL, bool *vR, int frame, Quat headQ) {
     Quat qP = { sinf(pitch * 0.5f), 0.0f, 0.0f, cosf(pitch * 0.5f) };
     Quat qY = { 0.0f, sinf(yaw * 0.5f), 0.0f, cosf(yaw * 0.5f) };
     Quat q = quatNorm(quatMul(qP, qY));   // head-LOCAL gaze (for the debug marker via cv)
-    // ALVR eye_gazes are in global tracking space, not head-relative. Compose with
-    // head orientation so the gaze is world-aligned.
+    // Server eye_gazes are in global tracking space, not head-relative. Compose
+    // with head orientation so the gaze is world-aligned.
     q = quatNorm(quatMul(headQ, q));
     out[0] = {}; out[1] = {};
     out[0].orientation = { q.x, q.y, q.z, q.w };
