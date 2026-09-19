@@ -38,6 +38,7 @@ add_library(p2wivrn_testable STATIC
     ${WIVRN_DIR}/common/smp.cpp
     ${WIVRN_DIR}/common/secrets.cpp
     ${WIVRN_DIR}/common/wivrn_sockets.cpp
+    ${WIVRN_DIR}/net/wivrn_client_pico.cpp
     ${CPP_DIR}/core/app_state.cpp
     ${CPP_DIR}/core/device_info.cpp
     ${CPP_DIR}/core/eye_tracking.cpp
@@ -116,7 +117,7 @@ foreach(sym
         BN_mod_inverse BN_rand BN_set_word
         EVP_MD_CTX_new EVP_DigestInit EVP_DigestUpdate EVP_DigestFinal
         socket bind connect listen accept setsockopt
-        recvfrom recv recvmmsg sendmsg sendmmsg writev
+        recvfrom recv recvmmsg sendmsg sendmmsg writev poll
         opendir fopen
         sched_setscheduler sched_setaffinity sched_getaffinity
         setpriority sysconf)

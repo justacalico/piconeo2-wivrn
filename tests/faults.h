@@ -9,6 +9,8 @@ extern "C" int test_fault_in;
 extern "C" long test_fault_ret;
 // Persistent mode: the named libc function fails on every call while set.
 extern "C" const char * test_fault_only;
+// Synthetic poll revents mask; see libc_wrap.cpp.
+extern "C" int test_poll_revents;
 
 // Run op() with the Nth wrapped call failing for N=1,2,... until it completes
 // without throwing: that is when every injectable site in the call chain has
