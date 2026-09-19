@@ -78,7 +78,7 @@ The keystore file path is relative to `src/`. If the file is absent, release bui
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Or grab a pre-built signed APK from the [GitHub releases](https://github.com/openlyst/piconeo2-wivrn/releases).
+Or grab a pre-built signed APK from the [GitLab releases](https://gitlab.com/HttpAnimations/piconeo2-wivrn/-/releases).
 
 ## Usage
 
