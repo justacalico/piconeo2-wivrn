@@ -19,7 +19,8 @@ set(WIVRN_DIR ${CPP_DIR}/wivrn)
 set(THIRD_PARTY_DIR ${CPP_DIR}/third_party)
 
 find_package(OpenSSL REQUIRED)
-find_package(JNI REQUIRED)
+# Only the headers and libjvm are needed; AWT is absent from headless JDKs.
+find_package(JNI REQUIRED COMPONENTS JVM)
 find_package(Threads REQUIRED)
 
 # The app build generates this at configure time; same contents here.
