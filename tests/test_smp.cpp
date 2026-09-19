@@ -1,9 +1,13 @@
 // wivrn/common/smp.cpp: the Socialist Millionaire Protocol used for PIN
 // pairing. Runs both parties (alice + bob) through the full exchange.
 #include "test_framework.h"
+#include "faults.h"
 #include "smp.h"
 
 #include <openssl/bn.h>
+
+#include <atomic>
+#include <thread>
 
 using crypto::bignum;
 using crypto::smp;
@@ -225,4 +229,23 @@ TEST(smp, constants_well_formed) {
 
 	CHECK(smp::SM_GENERATOR == bignum(2));
 	CHECK(smp::SM_MODULUS_MINUS_2 == smp::SM_MODULUS - bignum(2));
+}
+
+TEST(smp, bn_ctx_failure_throws) {
+	// bn_ctx() is thread_local: a fresh thread calls BN_CTX_new again.
+	test_fault_only = "BN_CTX_new";
+	std::atomic<bool> threw{false};
+	std::thread t([&] {
+		try
+		{
+			crypto::powm(bignum(2), bignum(3), smp::SM_MODULUS);
+		}
+		catch (...)
+		{
+			threw = true;
+		}
+	});
+	t.join();
+	test_fault_only = nullptr;
+	CHECK(threw);
 }
