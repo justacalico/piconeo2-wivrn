@@ -502,11 +502,20 @@ TEST(client, poll_dispatch_pending_and_socket_errors)
 		srv_recv(ctrl); // client's handshake
 		ctrl.send(to_headset::handshake{}); // completes client handshake
 
+		auto stage_deadline = std::chrono::steady_clock::now() + 15s;
 		while (stage.load() == 0)
+		{
+			if (std::chrono::steady_clock::now() > stage_deadline)
+				throw std::runtime_error("fake server: stage timeout");
 			std::this_thread::sleep_for(5ms);
+		}
 		ctrl.send(to_headset::timesync_query{.query = 12345});
 		while (stage.load() == 1)
+		{
+			if (std::chrono::steady_clock::now() > stage_deadline)
+				throw std::runtime_error("fake server: stage timeout");
 			std::this_thread::sleep_for(5ms);
+		}
 		// ctrl destructs with the thread -> client sees POLLHUP
 	});
 
@@ -836,8 +845,13 @@ TEST(client, stream_socket_error_throws_on_poll)
 		stream.connect(from);
 		stream.send(to_headset::handshake{});
 
+		auto kill_deadline = std::chrono::steady_clock::now() + 15s;
 		while (!kill_stream.load())
+		{
+			if (std::chrono::steady_clock::now() > kill_deadline)
+				throw std::runtime_error("fake server: kill timeout");
 			std::this_thread::sleep_for(5ms);
+		}
 		// Closing the stream socket makes the connected UDP fd report POLLERR
 		// (ICMP port unreachable) once the client writes again.
 		sockaddr_in6 peer_addr = from;
