@@ -110,6 +110,42 @@ void wait_peer_close(srv_control_t & ctrl)
 	::poll(&pfd, 1, 5000);
 }
 
+// Bounded accept: if the client's connect never lands (e.g. loopback quirks in
+// a container), the server thread must still be joinable.
+std::pair<srv_control_t, sockaddr_in6> srv_accept(wivrn::TCPListener & listener)
+{
+	pollfd pfd{listener.get_fd(), POLLIN, 0};
+	if (::poll(&pfd, 1, 15000) <= 0)
+		throw std::runtime_error("fake server: accept timeout");
+	return listener.accept<srv_control_t>();
+}
+
+// Bounded stream read, same reason.
+auto stream_recv(srv_stream_t & stream)
+{
+	pollfd pfd{stream.get_fd(), POLLIN, 0};
+	if (::poll(&pfd, 1, 15000) <= 0)
+		throw std::runtime_error("fake server: stream recv timeout");
+	return stream.receive_from_raw();
+}
+
+// A server-side exception must end the thread quietly: the client reports the
+// real failure through its own timeout or socket error, while join() still
+// returns instead of hanging the whole suite.
+template <typename F>
+std::thread run_server(F && f)
+{
+	return std::thread([fn = std::forward<F>(f)] {
+		try
+		{
+			fn();
+		}
+		catch (...)
+		{
+		}
+	});
+}
+
 // Serialize a to_headset packet into a wire frame ([u32 size][payload]) so a
 // test can write it onto the control fd in controlled pieces.
 template <typename T>
@@ -154,8 +190,8 @@ TEST(client, encryption_disabled_udp_stream)
 	int port = bound_port(listener.get_fd());
 	std::atomic<bool> got_stream_handshake{false};
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl); // client's confirmation crypto_handshake{}
@@ -163,7 +199,7 @@ TEST(client, encryption_disabled_udp_stream)
 		auto stream = make_stream();
 		ctrl.send(to_headset::handshake{.stream_port = bound_port(stream.get_fd())});
 
-		auto [raw, from] = stream.receive_from_raw();
+		auto [raw, from] = stream_recv(stream);
 		auto pkt = raw.deserialize<from_headset::packets>();
 		CHECK(std::holds_alternative<from_headset::handshake>(pkt));
 		got_stream_handshake = true;
@@ -193,8 +229,8 @@ TEST(client, encryption_disabled_tcp_only)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
@@ -224,8 +260,8 @@ TEST(client, pin_pairing_flow)
 	std::atomic<bool> pin_ok{false};
 	std::atomic<int> pin_fd{-1};
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		auto hello = read_hello(ctrl);
 		CHECK(hello.name == "test-headset");
 
@@ -255,7 +291,7 @@ TEST(client, pin_pairing_flow)
 		                         s.stream_iv_header_to_headset);
 		ctrl.send(to_headset::handshake{.stream_port = bound_port(stream.get_fd())});
 
-		auto [raw, from] = stream.receive_from_raw();
+		auto [raw, from] = stream_recv(stream);
 		auto pkt = raw.deserialize<from_headset::packets>();
 		CHECK(std::holds_alternative<from_headset::handshake>(pkt));
 
@@ -290,8 +326,8 @@ TEST(client, already_paired_tcp_only)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		auto hello = read_hello(ctrl);
 
 		crypto::key srv_key = crypto::key::generate_x25519_keypair();
@@ -326,8 +362,8 @@ TEST(client, wrong_pin_is_rejected)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		auto hello = read_hello(ctrl);
 
 		crypto::key srv_key = crypto::key::generate_x25519_keypair();
@@ -368,8 +404,8 @@ TEST(client, pairing_disabled_throws)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::pairing_disabled});
 		wait_peer_close(ctrl);
@@ -391,8 +427,8 @@ TEST(client, incompatible_version_throws)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::incompatible_version});
 		wait_peer_close(ctrl);
@@ -414,8 +450,8 @@ TEST(client, shutdown_flag_cancels_handshake)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		std::this_thread::sleep_for(300ms);
 	});
 
@@ -435,8 +471,8 @@ TEST(client, silent_server_times_out)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		std::this_thread::sleep_for(11s); // outlive the client's 10s handshake timeout
 	});
 
@@ -457,8 +493,8 @@ TEST(client, poll_dispatch_pending_and_socket_errors)
 	int port = bound_port(listener.get_fd());
 	std::atomic<int> stage{0};
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
@@ -511,8 +547,8 @@ TEST(client, send_paths_count_bytes)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
@@ -556,8 +592,8 @@ TEST(client, ipv4_udp_stream_fails)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
@@ -580,8 +616,8 @@ TEST(client, poll_failure_during_handshake)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		std::this_thread::sleep_for(300ms);
 	});
 
@@ -603,8 +639,8 @@ TEST(client, fragmented_packet_retries_receive)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 
 		// Hand-serialize the crypto_handshake answer and push it onto the wire
@@ -641,8 +677,8 @@ TEST(client, hangup_event_aborts_handshake)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		std::this_thread::sleep_for(300ms); // never answers, never polls
 	});
 
@@ -664,8 +700,8 @@ TEST(client, reset_peer_aborts_handshake)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		// RST, not a clean FIN: SO_LINGER{1,0} then close.
 		linger l{1, 0};
@@ -688,8 +724,8 @@ TEST(client, forged_smp_message_throws)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 
 		crypto::key srv_key = crypto::key::generate_x25519_keypair();
@@ -723,8 +759,8 @@ TEST(client, missing_second_handshake_is_not_fatal)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
@@ -748,8 +784,8 @@ TEST(client, stream_handshake_is_resent)
 	int port = bound_port(listener.get_fd());
 	std::atomic<int> stream_hellos{0};
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
@@ -759,11 +795,11 @@ TEST(client, stream_handshake_is_resent)
 
 		// Sit on the first hello long enough that the client resends it, then
 		// answer so the handshake completes.
-		auto [raw, from] = stream.receive_from_raw();
+		auto [raw, from] = stream_recv(stream);
 		stream.connect(from);
 		stream_hellos++;
 		std::this_thread::sleep_for(250ms);
-		auto [raw2, from2] = stream.receive_from_raw();
+		auto [raw2, from2] = stream_recv(stream);
 		stream_hellos++;
 		stream.send(to_headset::handshake{});
 		wait_peer_close(ctrl);
@@ -788,15 +824,15 @@ TEST(client, stream_socket_error_throws_on_poll)
 	int port = bound_port(listener.get_fd());
 	std::atomic<bool> kill_stream{false};
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
 
 		auto stream = make_stream();
 		ctrl.send(to_headset::handshake{.stream_port = bound_port(stream.get_fd())});
-		auto [raw, from] = stream.receive_from_raw();
+		auto [raw, from] = stream_recv(stream);
 		stream.connect(from);
 		stream.send(to_headset::handshake{});
 
@@ -844,15 +880,15 @@ TEST(client, poll_drains_pending_packets)
 	int port = bound_port(listener.get_fd());
 	std::atomic<int> stage{0};
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
 
 		auto stream = make_stream();
 		ctrl.send(to_headset::handshake{.stream_port = bound_port(stream.get_fd())});
-		auto [raw, from] = stream.receive_from_raw();
+		auto [raw, from] = stream_recv(stream);
 		stream.connect(from);
 		stream.send(to_headset::handshake{});
 
@@ -907,8 +943,8 @@ TEST(client, session_poll_failure_throws)
 	wivrn::TCPListener listener(0);
 	int port = bound_port(listener.get_fd());
 
-	std::thread srv([&] {
-		auto [ctrl, peer] = listener.accept<srv_control_t>();
+	std::thread srv = run_server([&] {
+		auto [ctrl, peer] = srv_accept(listener);
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::encryption_disabled});
 		srv_recv(ctrl);
