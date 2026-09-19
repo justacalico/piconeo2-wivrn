@@ -584,6 +584,8 @@ Java_org_meumeu_wivrn_neo2_pvr_MainActivity_nativeSetIpd(JNIEnv *, jobject, jflo
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_meumeu_wivrn_neo2_pvr_MainActivity_nativeSetMicrophone(JNIEnv *, jobject, jboolean enabled) {
+    gWivrnMicrophone.store(enabled == JNI_TRUE);
+    saveAllConfig();
     if (!g_stream) return;
     g_stream->microphone_enabled.store(enabled == JNI_TRUE);
     if (g_stream->audio_handle)

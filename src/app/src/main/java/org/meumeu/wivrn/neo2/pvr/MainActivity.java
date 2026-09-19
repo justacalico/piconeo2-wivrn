@@ -410,6 +410,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mVrUiPanel != null && mVrUiPanel.getLobbyView() != null) {
             try { nativeSetBitrate(mVrUiPanel.getLobbyView().getBitrate()); } catch (Throwable t) {}
             try { nativeSetFoveationEnabled(mVrUiPanel.getLobbyView().getFoveationEnabled()); } catch (Throwable t) {}
+            try { nativeSetMicrophone(mVrUiPanel.getLobbyView().isMicrophoneEnabled()); } catch (Throwable t) {}
             mVrUiPanel.getLobbyView().markAutoconnectAttempted();
         }
         nativeConnect(pendingHost, pendingPort, pendingTcpOnly);
@@ -879,6 +880,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
         Log.i(TAG, "connect requested " + hostname + ":" + port + " tcp=" + tcpOnly);
+        if (mVrUiPanel != null && mVrUiPanel.getLobbyView() != null)
+            try { nativeSetMicrophone(mVrUiPanel.getLobbyView().isMicrophoneEnabled()); } catch (Throwable t) {}
         try { nativeConnect(hostname, port, tcpOnly); } catch (Throwable t) { Log.e(TAG, "nativeConnect failed", t); }
     }
 
