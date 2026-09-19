@@ -128,6 +128,7 @@ target_compile_options(p2wivrn_tests PRIVATE -O0 -g --coverage)
 
 enable_testing()
 add_test(NAME p2wivrn_tests COMMAND p2wivrn_tests)
+set_tests_properties(p2wivrn_tests PROPERTIES TIMEOUT 600)
 
 # Coverage report over the library sources only (not the tests themselves).
 find_program(GCOV gcov REQUIRED)
