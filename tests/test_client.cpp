@@ -175,12 +175,17 @@ TEST(client, encryption_disabled_udp_stream)
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
-	                         [](int) { return "000000"; }, shutdown);
+	uint64_t sent = 0, received = 0;
+	{
+		wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
+		                         [](int) { return "000000"; }, shutdown);
+		sent = session.bytes_sent();
+		received = session.bytes_received();
+	}
 	srv.join();
 	CHECK(got_stream_handshake.load());
-	CHECK(session.bytes_sent() > 0);
-	CHECK(session.bytes_received() > 0);
+	CHECK(sent > 0);
+	CHECK(received > 0);
 }
 
 TEST(client, encryption_disabled_tcp_only)
@@ -199,12 +204,15 @@ TEST(client, encryption_disabled_tcp_only)
 		auto pkt = srv_recv(ctrl);
 		CHECK(std::holds_alternative<from_headset::handshake>(pkt));
 		ctrl.send(to_headset::handshake{});
+		wait_peer_close(ctrl);
 	});
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback4(port), true, kp, "test-headset",
-	                         [](int) { return "000000"; }, shutdown);
+	{
+		wivrn_session_pico session(loopback4(port), true, kp, "test-headset",
+		                         [](int) { return "000000"; }, shutdown);
+	}
 	srv.join();
 }
 
@@ -258,17 +266,22 @@ TEST(client, pin_pairing_flow)
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
-	                         [&](int fd) {
-		                         pin_fd = fd;
-		                         return PIN;
-	                         },
-	                         shutdown);
+	uint64_t sent = 0, received = 0;
+	{
+		wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
+		                         [&](int fd) {
+			                         pin_fd = fd;
+			                         return PIN;
+		                         },
+		                         shutdown);
+		sent = session.bytes_sent();
+		received = session.bytes_received();
+	}
 	srv.join();
 	CHECK(pin_ok.load());
 	CHECK(pin_fd.load() >= 0);
-	CHECK(session.bytes_sent() > 0);
-	CHECK(session.bytes_received() > 0);
+	CHECK(sent > 0);
+	CHECK(received > 0);
 }
 
 TEST(client, already_paired_tcp_only)
@@ -296,12 +309,15 @@ TEST(client, already_paired_tcp_only)
 		auto pkt = srv_recv(ctrl); // from_headset::handshake over control
 		CHECK(std::holds_alternative<from_headset::handshake>(pkt));
 		ctrl.send(to_headset::handshake{});
+		wait_peer_close(ctrl);
 	});
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback6(port), true, kp, "test-headset",
-	                         [](int) { return "999999"; }, shutdown);
+	{
+		wivrn_session_pico session(loopback6(port), true, kp, "test-headset",
+		                         [](int) { return "999999"; }, shutdown);
+	}
 	srv.join();
 }
 
@@ -333,6 +349,7 @@ TEST(client, wrong_pin_is_rejected)
 		catch (...)
 		{
 		}
+		wait_peer_close(ctrl);
 	});
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
@@ -355,6 +372,7 @@ TEST(client, pairing_disabled_throws)
 		auto [ctrl, peer] = listener.accept<srv_control_t>();
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::pairing_disabled});
+		wait_peer_close(ctrl);
 	});
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
@@ -377,6 +395,7 @@ TEST(client, incompatible_version_throws)
 		auto [ctrl, peer] = listener.accept<srv_control_t>();
 		read_hello(ctrl);
 		ctrl.send(to_headset::crypto_handshake{.state = crypto_state::incompatible_version});
+		wait_peer_close(ctrl);
 	});
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
@@ -504,19 +523,25 @@ TEST(client, send_paths_count_bytes)
 		// Drain whatever the test sends, keep the socket alive a moment.
 		for (int i = 0; i < 2; ++i)
 			srv_recv(ctrl);
+		wait_peer_close(ctrl);
 	});
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback6(port), true, kp, "test-headset",
-	                         [](int) { return "000000"; }, shutdown);
+	uint64_t sent = 0;
+	{
+		wivrn_session_pico session(loopback6(port), true, kp, "test-headset",
+		                         [](int) { return "000000"; }, shutdown);
 
-	uint64_t before = session.bytes_sent();
-	session.send_control(from_headset::timesync_response{.query = 1, .response = 2});
-	// tcp_only: send_stream falls back to the control socket.
-	session.send_stream(from_headset::timesync_response{.query = 3, .response = 4});
-	CHECK(session.bytes_sent() > before);
+		uint64_t before = session.bytes_sent();
+		session.send_control(from_headset::timesync_response{.query = 1, .response = 2});
+		// tcp_only: send_stream falls back to the control socket.
+		session.send_stream(from_headset::timesync_response{.query = 3, .response = 4});
+		sent = session.bytes_sent();
+		CHECK(sent > before);
+	}
 	srv.join();
+	CHECK(sent > 0);
 }
 
 TEST(client, handshake_error_carries_message)
@@ -596,13 +621,18 @@ TEST(client, fragmented_packet_retries_receive)
 		ctrl.send(to_headset::handshake{.stream_port = -1});
 		srv_recv(ctrl); // client's handshake
 		ctrl.send(to_headset::handshake{});
+		wait_peer_close(ctrl);
 	});
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback6(port), true, kp, "test-headset",
-	                         [](int) { return "000000"; }, shutdown);
-	CHECK(session.is_handshake_ok());
+	bool ok = false;
+	{
+		wivrn_session_pico session(loopback6(port), true, kp, "test-headset",
+		                         [](int) { return "000000"; }, shutdown);
+		ok = session.is_handshake_ok();
+	}
+	CHECK(ok);
 	srv.join();
 }
 
@@ -674,7 +704,7 @@ TEST(client, forged_smp_message_throws)
 		for (auto &b : forged)
 			b = crypto::bignum(2);
 		ctrl.send(to_headset::pin_check_2{.message = forged});
-		std::this_thread::sleep_for(100ms);
+		wait_peer_close(ctrl);
 	});
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
@@ -741,11 +771,15 @@ TEST(client, stream_handshake_is_resent)
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
-	                         [](int) { return "000000"; }, shutdown);
+	bool ok = false;
+	{
+		wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
+		                         [](int) { return "000000"; }, shutdown);
+		ok = session.is_handshake_ok();
+	}
 	srv.join();
 	CHECK(stream_hellos.load() >= 2);
-	CHECK(session.is_handshake_ok());
+	CHECK(ok);
 }
 
 TEST(client, stream_socket_error_throws_on_poll)
@@ -778,27 +812,29 @@ TEST(client, stream_socket_error_throws_on_poll)
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
-	                         [](int) { return "000000"; }, shutdown);
-	CHECK(session.is_handshake_ok());
-
-	kill_stream = true;
-	std::this_thread::sleep_for(50ms);
-	bool threw = false;
-	for (int i = 0; i < 20 && !threw; ++i)
 	{
-		session.send_stream(from_headset::handshake{});
-		try
+		wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
+		                         [](int) { return "000000"; }, shutdown);
+		CHECK(session.is_handshake_ok());
+
+		kill_stream = true;
+		std::this_thread::sleep_for(50ms);
+		bool threw = false;
+		for (int i = 0; i < 20 && !threw; ++i)
 		{
-			session.poll([](const auto &) {}, 50ms);
+			session.send_stream(from_headset::handshake{});
+			try
+			{
+				session.poll([](const auto &) {}, 50ms);
+			}
+			catch (const std::runtime_error &e)
+			{
+				threw = true;
+				CHECK(std::string(e.what()).find("stream socket") != std::string::npos);
+			}
 		}
-		catch (const std::runtime_error &e)
-		{
-			threw = true;
-			CHECK(std::string(e.what()).find("stream socket") != std::string::npos);
-		}
+		CHECK(threw);
 	}
-	CHECK(threw);
 	srv.join();
 }
 
@@ -843,24 +879,26 @@ TEST(client, poll_drains_pending_packets)
 
 	crypto::key kp = crypto::key::generate_x25519_keypair();
 	std::atomic<bool> shutdown{false};
-	wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
-	                         [](int) { return "000000"; }, shutdown);
-	CHECK(session.is_handshake_ok());
-
-	stage = 1;
-	int seen = 0;
-	for (int i = 0; i < 10 && seen < 4; ++i)
 	{
-		session.poll(
-		        [&](const auto &packet) {
-			        using T = std::remove_cvref_t<decltype(packet)>;
-			        if constexpr (std::is_same_v<T, to_headset::timesync_query>)
-				        ++seen;
-		        },
-		        300ms);
+		wivrn_session_pico session(loopback6(port), false, kp, "test-headset",
+		                         [](int) { return "000000"; }, shutdown);
+		CHECK(session.is_handshake_ok());
+
+		stage = 1;
+		int seen = 0;
+		for (int i = 0; i < 10 && seen < 4; ++i)
+		{
+			session.poll(
+			        [&](const auto &packet) {
+				        using T = std::remove_cvref_t<decltype(packet)>;
+				        if constexpr (std::is_same_v<T, to_headset::timesync_query>)
+					        ++seen;
+			        },
+			        300ms);
+		}
+		CHECK(seen == 4);
+		stage = 2;
 	}
-	CHECK(seen == 4);
-	stage = 2;
 	srv.join();
 }
 
