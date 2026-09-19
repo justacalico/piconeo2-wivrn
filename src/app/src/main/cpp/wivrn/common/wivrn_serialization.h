@@ -184,7 +184,7 @@ public:
 		serialization_traits<T>::serialize(value, *this);
 	}
 
-	constexpr void serialize_size(size_t size)
+	void serialize_size(size_t size)
 	{
 		if (size < 0x7fff)
 		{
