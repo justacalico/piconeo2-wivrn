@@ -34,7 +34,7 @@ host-tests:
   script:
     - cmake -B build-tests -S tests -DCMAKE_BUILD_TYPE=Debug
     - cmake --build build-tests -j"$(nproc)"
-    - cd build-tests && ctest --output-on-failure && cd ..
+    - (cd build-tests && ctest --output-on-failure)
     - ./tests/coverage.sh build-tests src/app/src/main/cpp 100
 
 github-sync:
