@@ -30,7 +30,7 @@ host-tests:
   timeout: 30m
   before_script:
     - apt-get update -qq
-    - apt-get install -y -qq cmake g++ make libssl-dev default-jdk-headless
+    - apt-get install -y -qq cmake g++ make libssl-dev libgles-dev default-jdk-headless
   script:
     - cmake -B build-tests -S tests -DCMAKE_BUILD_TYPE=Debug
     - cmake --build build-tests -j"$(nproc)"

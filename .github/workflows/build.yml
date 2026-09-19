@@ -30,7 +30,7 @@ jobs:
           java-version: '17'
 
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libgles-dev
 
       - name: Build host test suite
         run: |
