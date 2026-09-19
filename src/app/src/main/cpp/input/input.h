@@ -1,5 +1,6 @@
 #pragma once
 // Controller + head-pose state shared between JNI input sinks and the render thread.
+#include <cstdint>
 #include <mutex>
 
 // ---------- Pico controllers (data pushed from Java ControllerClient) -------
@@ -23,8 +24,9 @@ extern std::mutex gHeadMutex;
 extern float      gHeadData[7];
 
 // ---------- haptics (server -> controller rumble) ---------------------------
-// Render thread parks rumble requests here; Java controller poller drains them
-// each tick and calls vibrateCV2ControllerStrength(). hand 0=L/1=R.
+// The network thread parks rumble requests here via queueHaptic(); the Java
+// controller poller drains them each tick through nativeDrainHaptic() and calls
+// vibrateCV2ControllerStrength(). hand 0=L/1=R.
 // Coalesce (keep strongest pulse) rather than queue: between two ~11ms polls at
 // most one rumble matters.
 struct PendingHaptic {
@@ -34,3 +36,8 @@ struct PendingHaptic {
 };
 extern std::mutex     gHapticMutex;
 extern PendingHaptic  gHaptic[2];
+
+// Enqueue a rumble pulse. amplitude is clamped to (0,1]; duration_ns is
+// truncated to ms and clamped to [12,1000]. While a pulse is pending the
+// strongest amplitude and longest duration win.
+void queueHaptic(int hand, float amplitude, int64_t duration_ns);

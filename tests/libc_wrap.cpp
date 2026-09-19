@@ -6,6 +6,7 @@
 // report success or failure on demand.
 #include <dirent.h>
 #include <errno.h>
+#include <poll.h>
 #include <sched.h>
 #include <string.h>
 #include <stdio.h>
@@ -17,6 +18,10 @@
 extern "C" int test_fault_in;
 extern "C" long test_fault_ret = -1;
 extern "C" const char * test_fault_only = nullptr;
+// When nonzero, __wrap_poll stamps this mask into every fd's revents and
+// reports all fds ready: lets tests drive poll branches (POLLERR/POLLHUP
+// without POLLIN) that real sockets can't produce deterministically.
+extern "C" int test_poll_revents = 0;
 
 // Fails when the countdown hits 0, or on every call while test_fault_only names
 // this function (persistent mode for order-independent injection).
@@ -138,5 +143,22 @@ long __real_sysconf(int);
 long __wrap_sysconf(int name)
 {
 	return WRAPPED_FAILS("sysconf") ? test_fault_ret : __real_sysconf(name);
+}
+
+int __real_poll(struct pollfd *, nfds_t, int);
+int __wrap_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+	if (test_poll_revents)
+	{
+		for (nfds_t i = 0; i < nfds; ++i)
+			fds[i].revents = test_poll_revents;
+		return nfds;
+	}
+	if (WRAPPED_FAILS("poll"))
+	{
+		errno = EINTR;
+		return -1;
+	}
+	return __real_poll(fds, nfds, timeout);
 }
 }

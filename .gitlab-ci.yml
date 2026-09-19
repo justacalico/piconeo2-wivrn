@@ -1,10 +1,13 @@
-# The real build runs on GitHub (Android SDK + disk). Three jobs tie the two
+# The real build runs on GitHub (Android SDK + disk). Four jobs tie the two
 # sides together:
+#   host-tests           builds the tests/ suite on the host and enforces
+#                        100% line coverage of the testable sources
 #   github-sync          pushes every push/tag to the GitHub mirror
 #   github-dispatch      manual pipelines trigger the build and stream its log
 #   github-release-sync  copies the GitHub release back into a GitLab release
 #                        backed by the package registry - assets never expire
 stages:
+  - test
   - sync
   - build
   - release
@@ -20,6 +23,19 @@ variables:
   CHANNEL: "alpha"
   # Full clone: pushing a shallow history to GitHub fails with missing objects.
   GIT_DEPTH: "0"
+
+host-tests:
+  stage: test
+  image: debian:bookworm
+  timeout: 30m
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq cmake g++ make libssl-dev libgles-dev default-jdk-headless
+  script:
+    - cmake -B build-tests -S tests -DCMAKE_BUILD_TYPE=Debug
+    - cmake --build build-tests -j"$(nproc)"
+    - (cd build-tests && ctest --output-on-failure)
+    - ./tests/coverage.sh build-tests src/app/src/main/cpp 100
 
 github-sync:
   stage: sync

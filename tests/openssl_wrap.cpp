@@ -8,7 +8,11 @@
 #include <openssl/kdf.h>
 #include <openssl/pem.h>
 
+#include <string.h>
+
 extern "C" int test_fault_in = -1;
+// Defined in libc_wrap.cpp; when set, only the named function fails.
+extern "C" const char * test_fault_only;
 
 #define WRAPPED_FAILS() (test_fault_in > 0 && --test_fault_in == 0)
 
@@ -209,6 +213,8 @@ BIGNUM *__wrap_BN_new(void)
 BN_CTX *__real_BN_CTX_new(void);
 BN_CTX *__wrap_BN_CTX_new(void)
 {
+	if (test_fault_only && strcmp(test_fault_only, "BN_CTX_new") == 0)
+		return nullptr;
 	return WRAPPED_FAILS() ? nullptr : __real_BN_CTX_new();
 }
 

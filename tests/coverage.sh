@@ -2,10 +2,12 @@
 # Per-file line coverage of the tested library sources, via gcov.
 # A line counts as covered if it was hit in ANY translation unit (headers get
 # instantiated per-TU, so taking a single TU's numbers undercounts).
-# Usage: coverage.sh <build_dir> <cpp_dir>
+# Usage: coverage.sh <build_dir> <cpp_dir> [min_pct]
+# Exits nonzero when the merged total drops below min_pct (default 0).
 set -u
 BUILD="$(realpath "$1")"
 CPP="$(realpath "$2")"
+MIN="${3:-0}"
 
 WORK=$(mktemp -d)
 i=0
@@ -80,5 +82,11 @@ if [ "$total_lines" -gt 0 ]; then
     echo "------------------------------------------------------------"
     awk -v h="$total_hit" -v t="$total_lines" \
         'BEGIN {printf "TOTAL %6.2f%%  %5d lines\n", h * 100 / t, t}'
+    if ! awk -v h="$total_hit" -v t="$total_lines" -v min="$MIN" \
+        'BEGIN {exit (h * 100 / t >= min) ? 0 : 1}'; then
+        echo "coverage below ${MIN}% minimum" >&2
+        rm -rf "$WORK"
+        exit 1
+    fi
 fi
 rm -rf "$WORK"

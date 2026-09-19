@@ -22,7 +22,7 @@ sockaddr_in6 loopback6(uint16_t port)
 	sockaddr_in6 a{};
 	a.sin6_family = AF_INET6;
 	a.sin6_port = htons(port);
-	inet_pton(AF_INET6, "::1", &a.sin6_addr);
+	inet_pton(AF_INET6, "::ffff:127.0.0.1", &a.sin6_addr);
 	return a;
 }
 
