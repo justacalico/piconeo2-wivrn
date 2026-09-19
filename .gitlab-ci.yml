@@ -18,6 +18,8 @@ default:
 # -> Variables) to "release" or "beta" for a proper release.
 variables:
   CHANNEL: "alpha"
+  # Full clone: pushing a shallow history to GitHub fails with missing objects.
+  GIT_DEPTH: "0"
 
 github-sync:
   stage: sync
