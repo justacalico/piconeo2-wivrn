@@ -3,6 +3,7 @@
 #include "latency_tracker.h"
 #include "eye_tracking.h"
 #include "app_state.h"   // gManualLobby, requestPinEntryUI, gOnPinSubmit
+#include "input.h"       // queueHaptic
 #include "server_list.h" // setConnectionError / setConnecting for lobby UI
 
 #include <spdlog/spdlog.h>
@@ -346,20 +347,8 @@ void streaming_client::handle_packet(to_headset::packets & packet)
 				default:
 					break;
 			}
-			if (hand < 0 || p.amplitude <= 0.f)
-				return;
-
-			int ms = static_cast<int>(p.duration.count() / 1000000);
-			if (ms < 10)   ms = 10;
-			if (ms > 1000) ms = 1000;
-
-			std::lock_guard lock(haptics_mutex);
-			auto & slot = rumble[hand];
-			if (!slot.active || p.amplitude > slot.amplitude)
-				slot.amplitude = p.amplitude;
-			if (!slot.active || ms > slot.duration_ms)
-				slot.duration_ms = ms;
-			slot.active = true;
+			if (hand >= 0)
+				queueHaptic(hand, p.amplitude, p.duration.count());
 		}
 		else if constexpr (std::is_same_v<T, to_headset::timesync_query>)
 		{

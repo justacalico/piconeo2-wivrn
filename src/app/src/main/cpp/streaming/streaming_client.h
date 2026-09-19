@@ -155,15 +155,6 @@ struct streaming_client
 	std::optional<wivrn::to_headset::audio_stream_description> audio_desc;
 	std::unique_ptr<pico_audio> audio_handle;
 
-	struct rumble_slot
-	{
-		float amplitude = 0.f;
-		int duration_ms = 0;
-		bool active = false;
-	};
-	std::mutex haptics_mutex;
-	rumble_slot rumble[2];
-
 	std::atomic<bool> microphone_enabled{false};
 	std::atomic<bool> auto_reconnect{false};
 	std::atomic<int64_t> time_offset_ns{0};

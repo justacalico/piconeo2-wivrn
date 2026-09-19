@@ -41,7 +41,6 @@ add_library(p2wivrn_testable STATIC
     ${CPP_DIR}/core/app_state.cpp
     ${CPP_DIR}/core/device_info.cpp
     ${CPP_DIR}/core/eye_tracking.cpp
-    ${CPP_DIR}/core/foveation.cpp
     ${CPP_DIR}/input/input.cpp
     ${CPP_DIR}/ui/ui_kit.cpp
     ${CPP_DIR}/ui/eq_panel.cpp

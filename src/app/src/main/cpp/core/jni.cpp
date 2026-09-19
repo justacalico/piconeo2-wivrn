@@ -379,20 +379,6 @@ Java_org_meumeu_wivrn_neo2_pvr_MainActivity_nativeDrainHaptic(
     {
         std::lock_guard<std::mutex> lk(gHapticMutex);
         PendingHaptic &p = gHaptic[hand];
-        if (!p.pending && g_stream) {
-            std::lock_guard<std::mutex> hlk(g_stream->haptics_mutex);
-            auto &r = g_stream->rumble[hand];
-            if (r.active) {
-                p.pending = true;
-                p.amplitude = r.amplitude > 1.0f ? 1.0f : r.amplitude;
-                // Clamp to a sane on-device window: floor very short pulses so
-                // the motor fires, cap long ones so a stuck event can't buzz forever.
-                p.durationMs = r.duration_ms < 12 ? 12 : (r.duration_ms > 1000 ? 1000 : r.duration_ms);
-                r.active = false;
-                r.amplitude = 0.0f;
-                r.duration_ms = 0;
-            }
-        }
         if (!p.pending) return JNI_FALSE;
         amp = p.amplitude; ms = p.durationMs;
         p.pending = false; p.amplitude = 0.0f; p.durationMs = 0;
