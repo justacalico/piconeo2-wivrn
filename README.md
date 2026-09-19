@@ -2,9 +2,6 @@
 
 Native WiVRn client for the Pico Neo 2 family. Stream PC VR games to your headset over Wi-Fi or USB with low latency.
 
-> [!NOTE]
-> This project is in **Beta**. It works but expect some rough edges.
-
 ## Supported headsets
 
 | Headset | Status |
