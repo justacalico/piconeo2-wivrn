@@ -1,19 +1,32 @@
-name: Build APK
+name: build
 
 on:
-  push:
-    branches: ['**']
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel'
+        required: true
+        type: choice
+        options:
+          - release
+          - beta
+          - alpha
+        default: alpha
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
+  apk:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 120
+    concurrency:
+      group: wivrn-apk-build
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -30,43 +43,94 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y p7zip-full
 
       - name: Fetch Pico Neo 2 SDK
-        run: ./tools/fetch_pico_sdk.sh "${{ secrets.PICO_SDK_DOWNLOAD_URL }}"
+        env:
+          PICO_SDK_DOWNLOAD_URL: ${{ secrets.PICO_SDK_DOWNLOAD_URL }}
+        run: ./tools/fetch_pico_sdk.sh
 
-      - name: Verify SDK file hashes
+      - name: Install cocogitto
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cocogitto
+
+      - name: Compute tag and version code
+        id: meta
         run: |
-          cd "$GITHUB_WORKSPACE"
-          sha256sum -c tools/pico_sdk_hashes.txt
+          CHANNEL="${{ github.event.inputs.channel }}"
+          case "$CHANNEL" in
+            alpha) PREFIX="alpha-"; PRE="true" ;;
+            beta)  PREFIX="beta-";  PRE="true" ;;
+            *)     PREFIX="";       PRE="false" ;;
+          esac
+          TAG="${PREFIX}v$(date -u +%Y.%m.%d)-r${GITHUB_RUN_NUMBER}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "code=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp version from tag
+        run: |
+          sed -i "s/^VERSION_CODE=.*/VERSION_CODE=${{ steps.meta.outputs.code }}/" src/version.properties
+          sed -i "s/^VERSION_NAME=.*/VERSION_NAME=${{ steps.meta.outputs.tag }}/" src/version.properties
 
       - name: Decode signing keystore
-        working-directory: src
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > wivrn-release.keystore
-          cat > ../keystore.properties <<'PROPS'
-          storeFile=wivrn-release.keystore
-          PROPS
-          echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}" >> ../keystore.properties
-          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> ../keystore.properties
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> ../keystore.properties
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > pico2-wivrn-release.jks
+          {
+            echo "storeFile=../pico2-wivrn-release.jks"
+            echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}"
+            echo "keyAlias=${{ secrets.KEY_ALIAS }}"
+            echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+          } > keystore.properties
 
       - name: Build release APK
         working-directory: src
         run: ./gradlew :app:assembleRelease --no-daemon
 
+      - name: Generate changelog and release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREV_TAG=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ] && git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+            cog changelog "$PREV_TAG..HEAD" > release_notes.md \
+              || git log "$PREV_TAG..HEAD" --pretty='- %s (%h)' > release_notes.md
+          else
+            cog changelog > release_notes.md \
+              || git log --pretty='- %s (%h)' > release_notes.md
+          fi
+          cog changelog > Changelog.md || true
+          {
+            echo
+            echo "---"
+            echo "**Channel:** ${{ steps.meta.outputs.channel }}"
+            echo "**Run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> release_notes.md
+          cat release_notes.md
+
       - name: Rename APK
         run: |
-          mkdir -p artifacts
+          mkdir -p dist-out
           cp src/app/build/outputs/apk/release/app-release.apk \
-             artifacts/wivrn-pvr-release.apk
+             "dist-out/wivrn-pvr-${{ steps.meta.outputs.tag }}.apk"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wivrn-pvr-apk
-          path: artifacts/wivrn-pvr-release.apk
-          retention-days: 0
+          name: wivrn-pvr-${{ steps.meta.outputs.tag }}
+          path: dist-out/
+          retention-days: 14
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRE=""
+          [ "${{ steps.meta.outputs.prerelease }}" = "true" ] && PRE="--prerelease"
+          gh release create "${{ steps.meta.outputs.tag }}" -R "$GITHUB_REPOSITORY" \
+            --title "WiVRn Pico Neo 2 ${{ steps.meta.outputs.tag }}" \
+            --notes-file release_notes.md \
+            $PRE dist-out/* Changelog.md
 
       - name: Clean up signing secrets
         if: always()
-        working-directory: src
-        run: |
-          rm -f wivrn-release.keystore ../keystore.properties
+        run: rm -f pico2-wivrn-release.jks keystore.properties

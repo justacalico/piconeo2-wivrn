@@ -19,6 +19,7 @@ a.out
 *.pgm
 *.zip
 *.keystore
+*.jks
 keystore.properties
 gradle.properties
 local.properties
@@ -33,6 +34,12 @@ src/app/src/main/jniLibs/
 .wivrn-ref/
 tools/keyframe_tool.html
 *.log
+
+# CI release staging
+dist-out/
+release-assets/
+SHA256SUMS.txt
+release_notes.md
 
 # OpenXR POC
 openxr_poc/.gradle/

@@ -1,0 +1,81 @@
+# The real build runs on GitHub (Android SDK + disk). Three jobs tie the two
+# sides together:
+#   github-sync          pushes every push/tag to the GitHub mirror
+#   github-dispatch      manual pipelines trigger the build and stream its log
+#   github-release-sync  copies the GitHub release back into a GitLab release
+#                        backed by the package registry - assets never expire
+stages:
+  - sync
+  - build
+  - release
+
+default:
+  tags:
+    - linux-truenas
+
+# Default to alpha so test runs don't pollute the release/beta channels.
+# Override CHANNEL when running a pipeline manually (web UI "Run pipeline"
+# -> Variables) to "release" or "beta" for a proper release.
+variables:
+  CHANNEL: "alpha"
+
+github-sync:
+  stage: sync
+  image: alpine:3.20
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG
+  before_script:
+    - apk add --no-cache git openssh-client
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - cp "$GITHUB_SSH_PRIVATE_KEY" ~/.ssh/id_ed25519
+    - echo "" >> ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts
+  script:
+    - git remote add github git@github.com:justacalico/piconeo2-wivrn.git || true
+    - git remote update github
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        git push -f github "$CI_COMMIT_TAG"
+      else
+        git push github HEAD:refs/heads/main
+      fi
+
+github-dispatch:
+  stage: build
+  image: alpine:3.20
+  timeout: 4h
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+  before_script:
+    - apk add --no-cache bash curl jq git github-cli openssh-client
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - cp "$GITHUB_SSH_PRIVATE_KEY" ~/.ssh/id_ed25519
+    - echo "" >> ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts
+  script:
+    - CHANNEL="${CHANNEL:-release}" bash scripts/trigger-github-build.sh main HEAD
+
+github-release-sync:
+  stage: release
+  image: alpine:3.20
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+  variables:
+    GLAB_ENABLE_CI_AUTOLOGIN: "true"
+    GLAB_VERSION: "1.113.0"
+  before_script:
+    - apk add --no-cache bash curl jq git github-cli
+    - bash scripts/install-glab.sh
+    - |
+      if [ -n "${CI_SERVER_FQDN:-}" ]; then
+        glab auth login --job-token "$CI_JOB_TOKEN" --hostname "$CI_SERVER_FQDN" --api-protocol "https" --insecure-storage || true
+      fi
+  script:
+    - bash scripts/sync-from-github.sh

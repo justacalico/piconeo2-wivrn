@@ -1,0 +1,14 @@
+ignore_merge_commits = true
+
+[changelog]
+path = "Changelog.md"
+template = "remote"
+remote = "github.com"
+owner = "justacalico"
+repository = "piconeo2-wivrn"
+authors = [
+    { signature = "HttpAnimations", username = "HttpAnimations" },
+]
+
+[commit_types]
+misc = { changelog_title = "Other" }

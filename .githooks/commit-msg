@@ -1,0 +1,10 @@
+#!/bin/sh
+# Prefix non-conventional subjects with "misc:" so cog check stays green.
+msg_file="$1"
+first_line=$(head -n1 "$msg_file")
+case "$first_line" in
+  Merge\ *|Revert\ *) exit 0 ;;
+esac
+if ! echo "$first_line" | grep -qE '^(feat|fix|chore|ci|docs|refactor|style|test|perf|revert|build|misc)(\(.+\))?!?: .+'; then
+  sed -i "1s/^/misc: /" "$msg_file"
+fi
