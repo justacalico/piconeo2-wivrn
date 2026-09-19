@@ -107,6 +107,7 @@ void wivrn::UDP::subscribe_multicast(in6_addr address)
 	if (setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &subscribe, sizeof(subscribe)) < 0)
 	{
 		::close(fd);
+		fd = -1;
 		throw std::system_error{errno, std::generic_category()};
 	}
 }
@@ -121,6 +122,7 @@ void wivrn::UDP::unsubscribe_multicast(in6_addr address)
 	if (setsockopt(fd, IPPROTO_IPV6, IPV6_DROP_MEMBERSHIP, &subscribe, sizeof(subscribe)) < 0)
 	{
 		::close(fd);
+		fd = -1;
 		throw std::system_error{errno, std::generic_category()};
 	}
 }
@@ -150,6 +152,7 @@ void wivrn::TCP::init()
 	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0)
 	{
 		::close(fd);
+		fd = -1;
 		throw std::system_error{errno, std::generic_category()};
 	}
 
@@ -173,6 +176,7 @@ wivrn::TCP::TCP(sockaddr_in6 sa)
 	if (connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 	{
 		::close(fd);
+		fd = -1;
 		throw std::system_error{errno, std::generic_category()};
 	}
 
@@ -189,6 +193,7 @@ wivrn::TCP::TCP(sockaddr_in sa)
 	if (connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 	{
 		::close(fd);
+		fd = -1;
 		throw std::system_error{errno, std::generic_category()};
 	}
 
@@ -208,6 +213,7 @@ wivrn::TCPListener::TCPListener(int port)
 	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) < 0)
 	{
 		::close(fd);
+		fd = -1;
 		throw std::system_error{errno, std::generic_category()};
 	}
 
@@ -219,6 +225,7 @@ wivrn::TCPListener::TCPListener(int port)
 	if (bind(fd, (sockaddr *)&addr, sizeof(addr)) < 0)
 	{
 		::close(fd);
+		fd = -1;
 		throw std::system_error{errno, std::generic_category()};
 	}
 
@@ -226,6 +233,7 @@ wivrn::TCPListener::TCPListener(int port)
 	if (listen(fd, backlog) < 0)
 	{
 		::close(fd);
+		fd = -1;
 		throw std::system_error{errno, std::generic_category()};
 	}
 }
